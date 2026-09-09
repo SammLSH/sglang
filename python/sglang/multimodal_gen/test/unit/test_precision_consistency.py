@@ -70,6 +70,7 @@ autocast_enabled = precision.autocast_enabled
 get_module_dtype = precision.get_module_dtype
 precision_to_dtype = precision.precision_to_dtype
 resolve_component_precision = precision.resolve_component_precision
+resolve_decode_precision = precision.resolve_decode_precision
 resolve_precision = precision.resolve_precision
 temporary_module_dtype = precision.temporary_module_dtype
 
@@ -104,13 +105,17 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
     def _server_args(self, **overrides):
         config = {
             "vae_precision": "fp16",
+            "vae_decode_precision": None,
+            "vae_decode_precision_high": None,
             "audio_vae_precision": "bf16",
             "dit_precision": "fp32",
             "image_encoder_precision": "fp16",
             "text_encoder_precisions": ["fp16", "bf16"],
         }
         config.update(overrides)
-        return SimpleNamespace(pipeline_config=SimpleNamespace(**config))
+        return SimpleNamespace(
+            component_precisions={}, pipeline_config=SimpleNamespace(**config)
+        )
 
     def test_precision_lookup(self):
         server_args = self._server_args()
@@ -128,8 +133,66 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported custom_precision"):
             precision_to_dtype("fp8", "custom_precision")
 
+    def test_decode_precision_override_and_fallback(self):
+        self.assertEqual(
+            resolve_decode_precision(self._server_args()),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(self._server_args(vae_decode_precision="bf16")),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="high",
+            ),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="extra-high",
+            ),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="lossless",
+            ),
+            torch.float16,
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported vae_decode_precision"):
+            resolve_decode_precision(self._server_args(vae_decode_precision="fp8"))
+        with self.assertRaisesRegex(
+            ValueError, "Unsupported vae_decode_precision_high"
+        ):
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="fp8"), quality="high"
+            )
+
+    def test_exact_vae_precision_overrides_load_and_decode_defaults(self):
+        server_args = self._server_args(vae_decode_precision="bf16")
+        server_args.component_precisions["vae"] = "fp16"
+        server_args.component_precisions["video_vae"] = "bf16"
+
+        self.assertEqual(
+            resolve_precision(server_args, "vae", precision_attr="vae_precision"),
+            torch.float16,
+        )
+        self.assertEqual(resolve_decode_precision(server_args, "vae"), torch.float16)
+        self.assertEqual(
+            resolve_precision(server_args, "video_vae", precision_attr="vae_precision"),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(server_args, "video_vae"), torch.bfloat16
+        )
+
     def test_component_precision_mapping(self):
         server_args = self._server_args()
+        server_args.component_precisions["text_encoder_2"] = "fp32"
         expected = {
             "vae": torch.float16,
             "video_vae": torch.float16,
@@ -143,7 +206,7 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             "dual_tower_bridge": torch.float32,
             "image_encoder": torch.float16,
             "text_encoder": torch.float16,
-            "text_encoder_2": torch.bfloat16,
+            "text_encoder_2": torch.float32,
         }
 
         for module_name, expected_dtype in expected.items():
@@ -153,7 +216,11 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 module_name,
             )
 
-        self.assertIsNone(resolve_component_precision(SimpleNamespace(), "vae"))
+        self.assertIsNone(
+            resolve_component_precision(
+                SimpleNamespace(component_precisions={}, pipeline_config=None), "vae"
+            )
+        )
         self.assertIsNone(
             resolve_component_precision(server_args, "unregistered_component")
         )
