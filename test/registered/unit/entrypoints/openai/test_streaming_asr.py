@@ -3,10 +3,13 @@
 # ruff: noqa: E402 -- CPU kernel stubs must precede runtime imports.
 
 import asyncio
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
+import soundfile as sf
 from fastapi import HTTPException
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -19,6 +22,7 @@ from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
     ResolvedEncoderWindowPolicy,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
+    MAX_ASR_STREAMING_CHUNKS,
     ASRBackendAborted,
     StreamingASRState,
     common_unit_prefix,
@@ -27,6 +31,7 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     join_units,
     needs_space,
     normalize_unit,
+    split_audio_chunks,
     split_units,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
@@ -51,6 +56,70 @@ _ENGLISH_SAMPLES = [
     "한국어 단어 는 띄어쓰기 를 씁니다",
     "hyphen-ated tokens... and ellipses",
 ]
+
+
+class TestAudioChunks(CustomTestCase):
+    @staticmethod
+    def _wav(samples, sample_rate=16000):
+        buf = io.BytesIO()
+        sf.write(buf, samples, sample_rate, format="WAV")
+        return buf.getvalue()
+
+    def test_prefixes_are_encoded_on_demand_with_exact_tail(self):
+        audio = self._wav(np.linspace(-0.5, 0.5, 4001, dtype=np.float32))
+        decoded, _ = sf.read(io.BytesIO(audio), dtype="float32")
+        with patch(
+            "sglang.srt.entrypoints.openai.streaming_asr.sf.write", wraps=sf.write
+        ) as write:
+            chunks = split_audio_chunks(audio, 0.125)
+            self.assertEqual(len(chunks), 3)
+            write.assert_not_called()
+            for index, frames in enumerate((2000, 4000, 4001)):
+                data, rate = sf.read(io.BytesIO(chunks[index]), dtype="float32")
+                self.assertEqual(write.call_count, index + 1)
+                self.assertEqual(rate, 16000)
+                np.testing.assert_array_equal(data, decoded[:frames])
+            with self.assertRaises(IndexError):
+                chunks[len(chunks)]
+            self.assertEqual(write.call_count, 3)
+
+    def test_stereo_and_chunk_larger_than_audio_keep_full_input(self):
+        audio = self._wav(np.tile([0.25, -0.125], (100, 1)))
+        chunks = split_audio_chunks(audio, 100)
+        self.assertEqual(len(chunks), 1)
+        data, rate = sf.read(io.BytesIO(chunks[0]), dtype="float32")
+        self.assertEqual(rate, 16000)
+        np.testing.assert_array_equal(data, np.full(100, 0.0625))
+
+    def test_chunk_count_limit_includes_partial_tail_before_encoding(self):
+        for frames, accepted in (
+            (2 * MAX_ASR_STREAMING_CHUNKS, True),
+            (2 * MAX_ASR_STREAMING_CHUNKS + 1, False),
+        ):
+            audio = self._wav(np.zeros(frames, dtype=np.float32))
+            with (
+                self.subTest(frames=frames),
+                patch("sglang.srt.entrypoints.openai.streaming_asr.sf.write") as write,
+            ):
+                if accepted:
+                    chunks = split_audio_chunks(audio, 2 / 16000)
+                    self.assertEqual(len(chunks), MAX_ASR_STREAMING_CHUNKS)
+                else:
+                    with self.assertRaisesRegex(ValueError, "Increase chunk_size_sec"):
+                        split_audio_chunks(audio, 2 / 16000)
+                write.assert_not_called()
+
+    def test_invalid_durations_and_empty_audio_fail_before_encoding(self):
+        audio = self._wav(np.zeros(10, dtype=np.float32))
+        empty_wav = self._wav(np.zeros(0, dtype=np.float32))
+        with patch("sglang.srt.entrypoints.openai.streaming_asr.sf.write") as write:
+            for duration in (0, -1, float("nan"), float("inf"), 1e-5, 1e308):
+                with self.subTest(duration=duration), self.assertRaises(ValueError):
+                    split_audio_chunks(audio, duration)
+            for invalid_audio in (b"", b"invalid audio", empty_wav):
+                with self.subTest(audio=invalid_audio), self.assertRaises(ValueError):
+                    split_audio_chunks(invalid_audio, 2.0)
+            write.assert_not_called()
 
 
 class _LegacyState:

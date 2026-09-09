@@ -169,6 +169,12 @@ class TranscriptionAdapter(ABC):
         """
         return {}
 
+    def build_chunked_streaming_config(self, request: TranscriptionRequest) -> dict:
+        """Apply HTTP request overrides to a copy of the adapter's defaults."""
+        config = dict(self.chunked_streaming_config)
+        config.update(request.model_dump(include=set(config), exclude_none=True))
+        return config
+
     @property
     def realtime_encoder_window_policy(self) -> Optional[RealtimeEncoderWindowPolicy]:
         """Long-audio encoder-window policy, or None when the model has none."""

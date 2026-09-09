@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import math
 import re
 import unicodedata
 from contextlib import aclosing
@@ -99,29 +100,60 @@ class StreamingASRState:
         return self._record_emit(join_units(all_words[common_count:]))
 
 
-def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
+# Bound the number of cumulative backend decodes per upload. With the default
+# two-second chunks this permits over 34 minutes of input.
+MAX_ASR_STREAMING_CHUNKS = 1024
+
+
+@dataclass
+class AudioChunks:
+    """Decoded audio with cumulative WAV prefixes encoded only on demand."""
+
+    data: np.ndarray
+    sample_rate: int
+    chunk_size_samples: int
+
+    def __len__(self) -> int:
+        return (len(self.data) + self.chunk_size_samples - 1) // self.chunk_size_samples
+
+    def __getitem__(self, index: int) -> bytes:
+        index = range(len(self))[index]
+        end = min((index + 1) * self.chunk_size_samples, len(self.data))
+        buf = io.BytesIO()
+        sf.write(buf, self.data[:end], self.sample_rate, format="WAV")
+        return buf.getvalue()
+
+
+def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> AudioChunks:
+    """Validate the split and decode once, without retaining all prefix WAVs."""
     if not audio_data:
         raise ValueError("audio_data is empty")
-    if chunk_size_sec <= 0:
-        raise ValueError(f"chunk_size_sec must be positive, got {chunk_size_sec}")
-    audio_file = io.BytesIO(audio_data)
+    if not math.isfinite(chunk_size_sec) or chunk_size_sec <= 0:
+        raise ValueError("chunk_size_sec must be finite and positive")
     try:
-        data, sample_rate = sf.read(audio_file, dtype="float32")
+        with sf.SoundFile(io.BytesIO(audio_data)) as audio_file:
+            sample_rate = audio_file.samplerate
+            chunk_samples = chunk_size_sec * sample_rate
+            if not math.isfinite(chunk_samples):
+                raise ValueError("chunk_size_sec must resolve to a finite sample count")
+            chunk_size_samples = int(chunk_samples)
+            if chunk_size_samples < 1:
+                raise ValueError("chunk_size_sec must cover at least one audio sample")
+            total_samples = len(audio_file)
+            if not total_samples:
+                raise ValueError("audio_data contains no audio samples")
+            num_chunks = (total_samples + chunk_size_samples - 1) // chunk_size_samples
+            if num_chunks > MAX_ASR_STREAMING_CHUNKS:
+                raise ValueError(
+                    f"Audio requires {num_chunks} streaming chunks; the limit is "
+                    f"{MAX_ASR_STREAMING_CHUNKS}. Increase chunk_size_sec."
+                )
+            data = audio_file.read(dtype="float32")
     except sf.LibsndfileError as e:
         raise ValueError(f"failed to decode audio: {e}") from e
     if len(data.shape) > 1:
         data = data.mean(axis=1)
-    chunk_size_samples = int(chunk_size_sec * sample_rate)
-    total_samples = len(data)
-    chunks = []
-    for end in range(
-        chunk_size_samples, total_samples + chunk_size_samples, chunk_size_samples
-    ):
-        end = min(end, total_samples)
-        buf = io.BytesIO()
-        sf.write(buf, data[:end], sample_rate, format="WAV")
-        chunks.append(buf.getvalue())
-    return chunks
+    return AudioChunks(data, sample_rate, chunk_size_samples)
 
 
 def normalize_whitespace(text: str) -> str:

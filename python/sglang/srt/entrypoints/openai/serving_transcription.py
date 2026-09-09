@@ -51,6 +51,7 @@ from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
+    AudioChunks,
     StreamingASRState,
     needs_space,
     process_asr_chunk,
@@ -156,6 +157,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         stream: bool,
         raw_request: Request,
         timestamp_granularities: Optional[List[str]] = None,
+        chunk_size_sec: Optional[float] = None,
+        unfixed_chunk_num: Optional[int] = None,
+        unfixed_token_num: Optional[int] = None,
     ) -> Union[
         TranscriptionResponse,
         TranscriptionVerboseResponse,
@@ -248,6 +252,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
             timestamp_granularities=timestamp_granularities,
             stream=stream,
             audio_duration_s=audio_duration_s,
+            chunk_size_sec=chunk_size_sec,
+            unfixed_chunk_num=unfixed_chunk_num,
+            unfixed_token_num=unfixed_token_num,
         )
         if use_fused:
             request._fused_autodetect = True
@@ -465,14 +472,25 @@ class OpenAIServingTranscription(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ORJSONResponse]:
         """Handle streaming transcription request."""
         if self._adapter.supports_chunked_streaming:
+            state = StreamingASRState(
+                **self._adapter.build_chunked_streaming_config(request)
+            )
+            try:
+                # Reject invalid/excessive splits before starting the SSE
+                # response. Audio decoding must not block the event loop.
+                chunks = await asyncio.to_thread(
+                    split_audio_chunks, request.audio_data, state.chunk_size_sec
+                )
+            except ValueError as e:
+                return self.create_error_response(str(e))
             # No background abort_task: each chunk is a separate request;
             # client disconnection is detected via is_disconnected() in the loop.
             return StreamingResponse(
                 self._generate_chunked_asr_stream(
-                    adapted_request, request, raw_request
+                    adapted_request, request, raw_request, state, chunks
                 ),
                 media_type="text/event-stream",
             )
@@ -736,6 +754,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
         raw_request: Request,
+        state: StreamingASRState,
+        chunks: AudioChunks,
     ) -> AsyncGenerator[str, None]:
         """Chunk-based streaming for ASR with prefix rollback.
 
@@ -751,18 +771,18 @@ class OpenAIServingTranscription(OpenAIServingBase):
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
-        state = StreamingASRState(**self._adapter.chunked_streaming_config)
         # Track only the trailing char of the cumulative emit; `needs_space`
         # uses prev[-1] / cur[0] so we don't need to keep the full buffer.
         last_char = ""
 
         try:
-            chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
-
-            for i, chunk_audio in enumerate(chunks):
+            for i in range(len(chunks)):
                 if await raw_request.is_disconnected():
                     logger.info("[streaming_asr] client disconnected, stopping")
                     break
+                # Encode just this prefix, in a worker thread. Keeping every
+                # cumulative WAV would multiply memory by the chunk count.
+                chunk_audio = await asyncio.to_thread(chunks.__getitem__, i)
                 is_last = i == len(chunks) - 1
 
                 delta = await process_asr_chunk(
@@ -775,6 +795,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     raw_request=raw_request,
                     routing_key=self.extract_routing_key(raw_request),
                 )
+                del chunk_audio
 
                 if delta:
                     for word in delta.split(" "):

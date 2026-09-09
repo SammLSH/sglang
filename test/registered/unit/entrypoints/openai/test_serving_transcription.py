@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import asyncio
 import io
 import json
+import threading
 import unittest
 from typing import List
 from unittest.mock import AsyncMock, Mock, patch
@@ -31,6 +32,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.openai.streaming_asr import split_audio_chunks
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -64,6 +66,7 @@ class _MockTokenizerManager:
         self.server_args = Mock(
             incremental_streaming_output=False,
             asr_max_concurrent_sessions=32,
+            enable_asr_encoder_window=False,
         )
         self.tokenizer = Mock()
         self._stream_chunks = stream_chunks
@@ -271,6 +274,7 @@ class _MockChunkTokenizerManager:
         self.server_args = Mock(
             incremental_streaming_output=False,
             asr_max_concurrent_sessions=32,
+            enable_asr_encoder_window=False,
         )
         self.request_logger = Mock(log_requests=False)
         self.tokenizer = Mock()
@@ -772,6 +776,176 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
         self.assertFalse(any("<|" in d for d in emitted))
         self.assertEqual("".join(emitted), "Hello world")
         self.assertEqual(request.language, "en")
+
+
+class TestChunkedASRRequestConfig(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_override(self, get_context().override_server_args())
+
+    def test_multipart_overrides_are_validated_and_request_local(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from sglang.srt.entrypoints.http_server import openai_v1_audio_transcriptions
+
+        tm = _MockChunkTokenizerManager([])
+        tm.model_config.hf_config.architectures = ["Qwen3ASRForConditionalGeneration"]
+        serving = OpenAIServingTranscription(tm)
+        app = FastAPI()
+        app.post("/v1/audio/transcriptions")(openai_v1_audio_transcriptions)
+        app.state.openai_serving_transcription = serving
+        defaults = serving._adapter.chunked_streaming_config.copy()
+        audio = _long_wav_bytes(4.0)
+        with (
+            TestClient(app) as client,
+            patch(
+                "sglang.srt.entrypoints.openai.serving_transcription.process_asr_chunk",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ) as process,
+        ):
+            for overrides in (
+                {"chunk_size_sec": 1.0, "unfixed_chunk_num": 0, "unfixed_token_num": 2},
+                {"unfixed_chunk_num": 4},
+                {},
+            ):
+                with self.subTest(overrides=overrides):
+                    process.reset_mock()
+                    response = client.post(
+                        "/v1/audio/transcriptions",
+                        data={"stream": "true", **overrides},
+                        files={"file": ("test.wav", audio, "audio/wav")},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    expected = defaults | overrides
+                    self.assertEqual(
+                        process.await_count, 4 / expected["chunk_size_sec"]
+                    )
+                    self.assertEqual(
+                        [call.kwargs["is_last"] for call in process.await_args_list],
+                        [False] * (process.await_count - 1) + [True],
+                    )
+                    for call in process.await_args_list:
+                        state = call.kwargs["state"]
+                        for key, value in expected.items():
+                            self.assertEqual(getattr(state, key), value)
+                    self.assertEqual(
+                        "".join(_deltas_from_sse(response.text.splitlines())),
+                        " ".join(["hello"] * process.await_count),
+                    )
+                    self.assertEqual(
+                        serving._adapter.chunked_streaming_config, defaults
+                    )
+
+            for field, value in (
+                ("chunk_size_sec", "nan"),
+                ("chunk_size_sec", "inf"),
+                ("chunk_size_sec", 0),
+                ("unfixed_chunk_num", -1),
+                ("unfixed_token_num", 0),
+            ):
+                with self.subTest(field=field, value=value):
+                    process.reset_mock()
+                    response = client.post(
+                        "/v1/audio/transcriptions",
+                        data={"stream": "true", field: value},
+                        files={"file": ("test.wav", audio, "audio/wav")},
+                    )
+                    self.assertEqual(response.status_code, 422)
+                    process.assert_not_called()
+
+    def test_unsafe_chunk_sizes_return_http_error_before_sse_or_encoding(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from sglang.srt.entrypoints.http_server import openai_v1_audio_transcriptions
+
+        tm = _MockChunkTokenizerManager([])
+        tm.model_config.hf_config.architectures = ["Qwen3ASRForConditionalGeneration"]
+        app = FastAPI()
+        app.post("/v1/audio/transcriptions")(openai_v1_audio_transcriptions)
+        app.state.openai_serving_transcription = OpenAIServingTranscription(tm)
+        audio = _long_wav_bytes(0.25)
+        with (
+            TestClient(app) as client,
+            patch(
+                "sglang.srt.entrypoints.openai.serving_transcription.process_asr_chunk",
+                new_callable=AsyncMock,
+            ) as process,
+            patch("sglang.srt.entrypoints.openai.streaming_asr.sf.write") as write,
+        ):
+            for duration, error in (
+                (1 / 16000, "Increase chunk_size_sec"),
+                (1e-5, "at least one audio sample"),
+                (1e308, "finite sample count"),
+            ):
+                with self.subTest(duration=duration):
+                    response = client.post(
+                        "/v1/audio/transcriptions",
+                        data={"stream": "true", "chunk_size_sec": duration},
+                        files={"file": ("tiny.wav", audio, "audio/wav")},
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("application/json", response.headers["content-type"])
+                    self.assertIn(error, response.json()["message"])
+                    process.assert_not_called()
+                    write.assert_not_called()
+
+    def test_chunk_encoding_runs_off_loop_and_stops_after_disconnect(self):
+        tm = _MockChunkTokenizerManager([])
+        tm.model_config.hf_config.architectures = ["Qwen3ASRForConditionalGeneration"]
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(
+            stream=True, audio_data=_long_wav_bytes(4.0), chunk_size_sec=1.0
+        )
+        adapted = GenerateReqInput(text="", modalities=["audio"])
+        raw_request = Mock(is_disconnected=AsyncMock(side_effect=[False, True]))
+        preparation_threads, encoding_threads, writes_at_decode = [], [], []
+        original_write = sf.write
+
+        def prepare(*args):
+            preparation_threads.append(threading.get_ident())
+            return split_audio_chunks(*args)
+
+        def encode(*args, **kwargs):
+            encoding_threads.append(threading.get_ident())
+            return original_write(*args, **kwargs)
+
+        async def decode(**kwargs):
+            writes_at_decode.append(len(encoding_threads))
+            self.assertFalse(kwargs["is_last"])
+            self.assertEqual(sf.info(io.BytesIO(kwargs["audio_data"])).frames, 16000)
+            return "hello"
+
+        async def run():
+            loop_thread = threading.get_ident()
+            with (
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_transcription.split_audio_chunks",
+                    side_effect=prepare,
+                ),
+                patch(
+                    "sglang.srt.entrypoints.openai.streaming_asr.sf.write",
+                    side_effect=encode,
+                ),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_transcription.process_asr_chunk",
+                    side_effect=decode,
+                ),
+            ):
+                response = await serving._handle_streaming_request(
+                    adapted, request, raw_request
+                )
+                self.assertEqual(encoding_threads, [])
+                frames = [frame async for frame in response.body_iterator]
+            self.assertEqual(writes_at_decode, [1])
+            self.assertEqual(len(encoding_threads), 1)
+            self.assertEqual(len(preparation_threads), 1)
+            self.assertNotIn(loop_thread, preparation_threads + encoding_threads)
+            self.assertEqual(_deltas_from_sse(frames), ["hello"])
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
