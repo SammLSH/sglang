@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionUsage,
     TranscriptionVerboseResponse,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
+    RealtimeEncoderWindowPolicy,
     TranscriptionAdapter,
     register_transcription_adapter,
 )
@@ -24,7 +27,6 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def chunked_streaming_config(self) -> dict:
         # Qwen3-ASR paper (arXiv:2601.21337), Table 8 uses 4 unfixed chunks.
         # We use 2 here for lower latency; tune based on quality needs.
-        # TODO: allow users to override these via API request parameters.
         return {
             "chunk_size_sec": 2.0,
             "unfixed_chunk_num": 2,
@@ -34,6 +36,23 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     @property
     def prompt_template(self) -> str:
         return DEFAULT_ASR_PROMPT
+
+    @property
+    def realtime_encoder_window_policy(self) -> RealtimeEncoderWindowPolicy:
+        return RealtimeEncoderWindowPolicy(
+            # Equals the default --asr-max-buffer-seconds, so windowing stays
+            # dormant until an operator raises the per-item cap.
+            min_audio_sec=60.0,
+            # Six encoder-native 8 s windows (48 s) of rolling acoustic
+            # context per request; older speech is carried by the prefix.
+            max_audio_context_windows=6,
+            # Default recent-text budget, overridable at server startup.
+            decoder_prefix_max_tokens=192,
+            decoder_prefix_holdback_units=1,
+            # Suffix continuation is validated for explicit English sessions.
+            # Unknown and auto-detected languages keep cumulative semantics.
+            supported_languages=("en",),
+        )
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature
@@ -50,6 +69,17 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
         if self.ASR_TEXT_TAG in text:
             return text.split(self.ASR_TEXT_TAG, 1)[-1]
         return text
+
+    def postprocess_streaming_text(
+        self, text: str, *, continuation: bool = False
+    ) -> Optional[str]:
+        # The forced "language xx<asr_text>" prefix may span several decoder
+        # updates; nothing before the delimiter is transcript text. A prompt
+        # that already ends with transcript text is continued without the
+        # prefix, so waiting for the delimiter would hide every snapshot.
+        if not continuation and self.ASR_TEXT_TAG not in text:
+            return None
+        return self.postprocess_text(text)
 
     def build_verbose_response(
         self,

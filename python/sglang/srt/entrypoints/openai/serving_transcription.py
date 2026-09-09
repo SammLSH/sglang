@@ -46,6 +46,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.realtime import (
     handle_realtime_transcription,
 )
+from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
+    resolve_realtime_encoder_window_policy,
+)
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
@@ -77,6 +80,22 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._session_semaphore = asyncio.Semaphore(
             get_serving().asr_max_concurrent_sessions
         )
+        # Resolved once per server, not per connection: geometry validation
+        # runs the feature extractor and must fail here, at startup.
+        self._encoder_window = None
+        serving_config = get_serving()
+        if serving_config.enable_asr_encoder_window:
+            self._encoder_window = resolve_realtime_encoder_window_policy(
+                adapter=self._adapter,
+                mm_processor=tokenizer_manager.mm_processor,
+                tokenizer=tokenizer_manager.tokenizer,
+                max_buffer_seconds=serving_config.asr_max_buffer_seconds,
+                dp_size=tokenizer_manager.elastic_worker_count,
+                min_audio_sec=serving_config.asr_encoder_window_min_audio_seconds,
+                max_audio_context_windows=serving_config.asr_encoder_window_max_context_windows,
+                decoder_prefix_max_tokens=serving_config.asr_decoder_prefix_max_tokens,
+                decoder_prefix_holdback_units=serving_config.asr_decoder_prefix_holdback_units,
+            )
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -806,4 +825,5 @@ class OpenAIServingTranscription(OpenAIServingBase):
             adapter=self._adapter,
             server_args=self.tokenizer_manager.server_args,
             session_semaphore=self._session_semaphore,
+            encoder_window=self._encoder_window,
         )

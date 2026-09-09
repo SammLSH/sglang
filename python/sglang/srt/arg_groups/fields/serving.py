@@ -229,6 +229,30 @@ class Serving:
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
     ] = 32
+    enable_asr_encoder_window: A[
+        bool,
+        "Enable encoder-window rolling context for realtime ASR models that declare independently encodable audio windows. It activates only after the configured long-audio threshold (the adapter's default unless overridden), so raise --asr-max-buffer-seconds above that threshold. Models and languages without a declared policy stay cumulative. Experimental; not supported with disaggregation.",
+    ] = False
+    asr_encoder_window_min_audio_seconds: A[
+        Optional[float],
+        "Override the audio duration threshold for encoder-window realtime ASR. Must be finite and non-negative; activation is checked after the threshold, rounded up to an inference boundary. Raise --asr-max-buffer-seconds above that boundary. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+    ] = None
+    asr_encoder_window_max_context_windows: A[
+        Optional[int],
+        "Override the number of complete encoder-native windows kept as rolling acoustic context in realtime ASR, plus the mutable tail. Must be positive. This does not change the model's native window size; fewer windows can reduce transcription accuracy. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+    ] = None
+    asr_decoder_prefix_max_tokens: A[
+        Optional[int],
+        "Override the transcript-prefix token limit for encoder-window realtime ASR. Must be positive. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+    ] = None
+    asr_decoder_prefix_holdback_units: A[
+        Optional[int],
+        "Override the number of agreed text units held back in encoder-window realtime ASR (words for English). Must be non-negative; 0 disables the extra holdback. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+    ] = None
+    enable_asr_decoder_streaming: A[
+        bool,
+        "Publish append-safe realtime transcription deltas while a backend ASR decode is still running (each backend request streams). Independent of --enable-asr-encoder-window. Experimental.",
+    ] = False
     preferred_sampling_params: A[
         Optional[str],
         Arg(

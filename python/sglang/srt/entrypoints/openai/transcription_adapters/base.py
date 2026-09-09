@@ -1,13 +1,64 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import List, Optional
+
+import msgspec
 
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionUsage,
     TranscriptionVerboseResponse,
 )
+
+
+class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
+    """How a realtime session may switch to encoder-window continuation.
+
+    The window geometry itself comes from the multimodal processor; this is
+    the adapter's declaration of when windowing is safe for its model.
+    """
+
+    # Audio duration after which an item switches from cumulative decoding.
+    min_audio_sec: float
+    # Complete windows kept in each steady-state request; older audio is
+    # represented only by the decoder prefix.
+    max_audio_context_windows: int
+    # Primary language codes (lowercase) validated for suffix continuation.
+    supported_languages: tuple[str, ...]
+    # Recent emitted text carried into each request as decoder context.
+    decoder_prefix_max_tokens: int = 192
+    # Agreed units held back from publication to absorb an unstable tail.
+    decoder_prefix_holdback_units: int = 1
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.min_audio_sec) or self.min_audio_sec < 0:
+            raise ValueError("min_audio_sec must be finite and non-negative")
+        if self.max_audio_context_windows <= 0:
+            raise ValueError("max_audio_context_windows must be positive")
+        if self.decoder_prefix_max_tokens <= 0:
+            raise ValueError("decoder_prefix_max_tokens must be positive")
+        if self.decoder_prefix_holdback_units < 0:
+            raise ValueError("decoder_prefix_holdback_units must be non-negative")
+        if not self.supported_languages or not all(
+            isinstance(language, str) and language.strip()
+            for language in self.supported_languages
+        ):
+            raise ValueError("supported_languages must contain language codes")
+        normalized = tuple(
+            _primary_language(language) for language in self.supported_languages
+        )
+        msgspec.structs.force_setattr(self, "supported_languages", normalized)
+
+    def supports_language(self, language: Optional[str]) -> bool:
+        if not language:
+            return False
+        return _primary_language(language) in self.supported_languages
+
+
+def _primary_language(language: str) -> str:
+    return language.strip().lower().replace("_", "-").split("-", 1)[0]
 
 
 class TranscriptionAdapter(ABC):
@@ -117,6 +168,23 @@ class TranscriptionAdapter(ABC):
         Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.
         """
         return {}
+
+    @property
+    def realtime_encoder_window_policy(self) -> Optional[RealtimeEncoderWindowPolicy]:
+        """Long-audio encoder-window policy, or None when the model has none."""
+        return None
+
+    def postprocess_streaming_text(
+        self, text: str, *, continuation: bool = False
+    ) -> Optional[str]:
+        """Return the visible part of a partial decoder snapshot.
+
+        ``None`` means a model-specific prefix is still incomplete and the
+        caller should keep buffering. ``continuation`` says the prompt already
+        ended with transcript text the model is extending, so no such prefix
+        is expected. Defaults to ``postprocess_text``.
+        """
+        return self.postprocess_text(text)
 
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.

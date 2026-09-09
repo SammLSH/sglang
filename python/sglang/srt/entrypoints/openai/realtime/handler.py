@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import RealtimeErrorEvent
 from openai.types.realtime.realtime_error import RealtimeError
 
+from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
+    ResolvedEncoderWindowPolicy,
+)
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -68,6 +72,7 @@ async def handle_realtime_transcription(
     adapter: TranscriptionAdapter,
     server_args: ServerArgs,
     session_semaphore: asyncio.Semaphore,
+    encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
 ) -> None:
     """WS endpoint for /v1/realtime. Pre-session validation runs before
     the semaphore so rejects don't consume a session slot; the
@@ -99,7 +104,11 @@ async def handle_realtime_transcription(
                 logger.debug("[realtime] accept failed: %s", e)
                 return
             connection = RealtimeConnection(
-                websocket, tokenizer_manager, adapter, server_args
+                websocket,
+                tokenizer_manager,
+                adapter,
+                server_args,
+                encoder_window=encoder_window,
             )
             await connection.run()
         except WebSocketDisconnect:
