@@ -11,6 +11,7 @@ from sglang.srt.configs.qwen3_omni import Qwen3OmniMoeAudioEncoderConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    concat_padded_audio_features,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -72,22 +73,13 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = next(self.audio_tower.parameters()).device
 
-        input_features = (
-            torch.cat([item.feature for item in items])
-            .type(self.audio_tower.dtype)
-            .to(device)
-        )
+        # Items batched across requests can come from different audio
+        # durations, so their mel frame counts differ; pad before concatenating.
+        input_features, feature_attention_mask = concat_padded_audio_features(items)
+        input_features = input_features.type(self.audio_tower.dtype).to(device)
 
-        has_mask = all(
-            getattr(item, "feature_attention_mask", None) is not None for item in items
-        )
-
-        if has_mask:
-            feature_attention_mask = (
-                torch.cat([item.feature_attention_mask for item in items], dim=0)
-                .type(torch.long)
-                .to(device)
-            )
+        if feature_attention_mask is not None:
+            feature_attention_mask = feature_attention_mask.type(torch.long).to(device)
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = input_features.permute(0, 2, 1)[
                 feature_attention_mask.bool()

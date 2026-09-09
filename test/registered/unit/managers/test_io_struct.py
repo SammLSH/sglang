@@ -1091,6 +1091,20 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_preserves_mm_processor_kwargs(self):
+        """Processor kwargs are request-scoped and shared by every subrequest."""
+        kwargs = {"encoder_window": {"window_samples": 16}}
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            mm_processor_kwargs=kwargs,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertIs(req[0].mm_processor_kwargs, kwargs)
+        self.assertIs(req[1].mm_processor_kwargs, kwargs)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")

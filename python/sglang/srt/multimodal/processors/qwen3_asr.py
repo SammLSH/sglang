@@ -3,8 +3,10 @@ from typing import Union
 
 import torch
 
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from sglang.srt.multimodal.encoder_window import EncoderWindowMixin, EncoderWindowSpec
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -17,7 +19,7 @@ DEFAULT_ASR_PROMPT = (
 )
 
 
-class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
+class Qwen3ASRMultimodalProcessor(EncoderWindowMixin, BaseMultimodalProcessor):
     models = [Qwen3ASRForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -46,6 +48,17 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if not input_text or not input_text.strip():
             return DEFAULT_ASR_PROMPT
         return input_text
+
+    def encoder_window_spec(self) -> EncoderWindowSpec:
+        audio_config = self.hf_config.thinker_config.audio_config
+        # The audio encoder convolves and position-encodes 2 * n_window mel
+        # frames at a time and attends within n_window_infer frames, so one
+        # n_window_infer-frame window is the smallest independently encodable
+        # unit and must hold a whole number of convolution blocks.
+        return EncoderWindowSpec(
+            window_frames=int(audio_config.n_window_infer),
+            alignment_frames=2 * int(audio_config.n_window),
+        )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         if isinstance(input_ids, list):
@@ -76,8 +89,16 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
+        # Only generate requests carry per-request processor kwargs.
+        mm_processor_kwargs = (
+            request_obj.mm_processor_kwargs
+            if isinstance(request_obj, GenerateReqInput)
+            else None
+        )
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
-            base_output, self.mm_tokens
+            base_output,
+            self.mm_tokens,
+            mm_processor_kwargs=mm_processor_kwargs,
         )
 
         mrope_positions, mrope_position_delta = self.compute_mrope_positions(

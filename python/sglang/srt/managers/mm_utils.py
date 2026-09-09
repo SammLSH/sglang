@@ -35,6 +35,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -363,6 +364,64 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
+
+
+def concat_padded_audio_features(
+    items: List[MultimodalDataItem], *, mask_key: str = "feature_attention_mask"
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Batch per-item audio features whose frame counts may differ.
+
+    Each ``item.feature`` is ``(batch, n_mels, frames)``. Features are
+    zero-padded along the frame axis to the widest item before ``torch.cat``
+    along dim 0, so items produced from different audio durations can share
+    one encoder call. Items carrying ``mask_key`` (``(batch, frames)``, 1 for a
+    valid frame) get the same zero padding on the mask. Without any mask the
+    second return value is ``None``; when only some items carry a mask, the
+    others get an all-ones mask over their unpadded frames so per-item lengths
+    stay exact. Equal-width inputs yield exactly ``torch.cat(features)``.
+    """
+    if not items:
+        raise ValueError("concat_padded_audio_features requires at least one item")
+
+    features = [item.feature for item in items]
+    masks = [item.model_specific_data.get(mask_key) for item in items]
+    for feature in features:
+        if not isinstance(feature, torch.Tensor) or feature.dim() != 3:
+            raise ValueError(
+                "audio features must be (batch, n_mels, frames) tensors, got "
+                f"{type(feature).__name__}"
+                + (
+                    f" with shape {tuple(feature.shape)}"
+                    if hasattr(feature, "shape")
+                    else ""
+                )
+            )
+
+    widths = [feature.shape[-1] for feature in features]
+    max_width = max(widths)
+    use_masks = any(mask is not None for mask in masks)
+
+    padded_features = []
+    padded_masks = []
+    for feature, mask, width in zip(features, masks, widths):
+        padding = max_width - width
+        if padding:
+            feature = nn.functional.pad(feature, (0, padding))
+        padded_features.append(feature)
+        if not use_masks:
+            continue
+        if mask is None:
+            mask = torch.ones(
+                (feature.shape[0], width), dtype=torch.long, device=feature.device
+            )
+        if padding:
+            mask = nn.functional.pad(mask, (0, padding))
+        padded_masks.append(mask)
+
+    concatenated = torch.cat(padded_features, dim=0)
+    if not use_masks:
+        return concatenated, None
+    return concatenated, torch.cat(padded_masks, dim=0)
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus

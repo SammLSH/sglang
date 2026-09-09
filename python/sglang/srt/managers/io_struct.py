@@ -220,6 +220,10 @@ class GenerateReqInput:
     use_audio_in_video: bool = False
     # Optional request-scoped video processor configuration.
     video_config: Optional[Dict[str, Any]] = None
+    # Optional request-scoped keyword arguments interpreted by the multimodal
+    # processor (for example an encoder-window geometry). Values must be plain
+    # JSON-compatible data; a processor validates only the keys it consumes.
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.
@@ -896,6 +900,7 @@ class GenerateReqInput:
                 if self.mm_content_hashes is not None
                 else None
             ),
+            mm_processor_kwargs=self.mm_processor_kwargs,
             sampling_params=self.sampling_params[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
