@@ -200,8 +200,17 @@ def _get_feat_extract_output_lengths(input_lengths):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeAudioEncoderConfig,
+        quant_config=None,
+        *,
+        pad_to_full_conv_block: bool = False,
+    ):
         super().__init__(config)
+        if pad_to_full_conv_block and 2 * config.n_window != 100:
+            raise ValueError("fixed convolution padding requires 100-frame blocks")
+        self.pad_to_full_conv_block = pad_to_full_conv_block
         self.dropout = config.dropout
 
         embed_dim = config.d_model
@@ -293,14 +302,25 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         padded_feature = nn.utils.rnn.pad_sequence(
             chunk_list, batch_first=True
         ).transpose(1, 2)
+        # ASR opts in once at construction so a short tail sees the same
+        # convolution padding regardless of other cache misses. Other callers
+        # retain their existing padding and length behavior.
+        block_frames = self.n_window * 2
+        if self.pad_to_full_conv_block and padded_feature.shape[-1] < block_frames:
+            padded_feature = F.pad(
+                padded_feature, (0, block_frames - padded_feature.shape[-1])
+            )
 
         # Introduce vectorized mask to avoid many small tensors
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
-        max_len_after_cnn = (
-            int(feature_lens_after_cnn.max().item())
-            if feature_lens_after_cnn.numel()
-            else 0
-        )
+        if self.pad_to_full_conv_block:
+            max_len_after_cnn = (block_frames + 7) // 8
+        else:
+            max_len_after_cnn = (
+                int(feature_lens_after_cnn.max().item())
+                if feature_lens_after_cnn.numel()
+                else 0
+            )
 
         idx = torch.arange(max_len_after_cnn, device=padded_feature.device)
         padded_mask_after_cnn = idx.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)

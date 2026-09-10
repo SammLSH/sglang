@@ -6,7 +6,10 @@ import torch
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
-from sglang.srt.multimodal.encoder_window import EncoderWindowMixin, EncoderWindowSpec
+from sglang.srt.multimodal.encoder_window import (
+    AudioEncoderWindowSpec,
+    WindowedAudioProcessorMixin,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -14,12 +17,14 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
+# The model's chat template includes a system turn even without context.
 DEFAULT_ASR_PROMPT = (
+    "<|im_start|>system\n<|im_end|>\n"
     f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 
-class Qwen3ASRMultimodalProcessor(EncoderWindowMixin, BaseMultimodalProcessor):
+class Qwen3ASRMultimodalProcessor(WindowedAudioProcessorMixin, BaseMultimodalProcessor):
     models = [Qwen3ASRForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -49,15 +54,21 @@ class Qwen3ASRMultimodalProcessor(EncoderWindowMixin, BaseMultimodalProcessor):
             return DEFAULT_ASR_PROMPT
         return input_text
 
-    def encoder_window_spec(self) -> EncoderWindowSpec:
+    def audio_encoder_window_spec(self) -> AudioEncoderWindowSpec:
         audio_config = self.hf_config.thinker_config.audio_config
+        alignment_frames = 2 * int(audio_config.n_window)
+        if alignment_frames != 100:
+            raise ValueError(
+                "Qwen3-ASR encoder windowing requires 100-frame convolution blocks; "
+                f"configured {alignment_frames} frames"
+            )
         # The audio encoder convolves and position-encodes 2 * n_window mel
         # frames at a time and attends within n_window_infer frames, so one
         # n_window_infer-frame window is the smallest independently encodable
         # unit and must hold a whole number of convolution blocks.
-        return EncoderWindowSpec(
+        return AudioEncoderWindowSpec(
             window_frames=int(audio_config.n_window_infer),
-            alignment_frames=2 * int(audio_config.n_window),
+            alignment_frames=alignment_frames,
         )
 
     def compute_mrope_positions(self, input_ids, mm_items):

@@ -15,6 +15,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+import numpy as np
 import pybase64
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import (
@@ -56,7 +57,6 @@ from sglang.srt.entrypoints.openai.realtime.asr_processor import (
 )
 from sglang.srt.entrypoints.openai.realtime.audio_buffer import (
     PCM_SAMPLE_WIDTH_BYTES,
-    resample_to_target_rate,
 )
 from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
     ResolvedEncoderWindowPolicy,
@@ -80,6 +80,22 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
+
+
+def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
+    if src_rate == target_rate or not pcm:
+        return pcm
+    import torch
+    import torchaudio
+
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    audio = torch.from_numpy(samples).unsqueeze(0)
+    audio = torchaudio.functional.resample(
+        audio, orig_freq=src_rate, new_freq=target_rate
+    )
+    samples = audio.squeeze(0).numpy()
+    # Clip to int16 range via 2^15 - 1 so a clipped 1.0 stays representable.
+    return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
 _CLIENT_EVENT_TYPES: Dict[str, type] = {
@@ -153,7 +169,6 @@ class RealtimeConnection:
         self.asr_processor = RealtimeASRProcessor(
             tokenizer_manager=tokenizer_manager,
             adapter=adapter,
-            server_args=server_args,
             encoder_window=encoder_window,
             session_id=self.session_id,
         )
@@ -326,12 +341,7 @@ class RealtimeConnection:
         cfg = event.session
 
         # Session updates are patches; omitted nested fields retain their values.
-        session_audio = cfg.audio if "audio" in cfg.model_fields_set else None
-        audio = (
-            session_audio.input
-            if session_audio is not None and "input" in session_audio.model_fields_set
-            else None
-        )
+        audio = cfg.audio.input if cfg.audio is not None else None
         audio_fields = audio.model_fields_set if audio is not None else set()
         transcription_present = "transcription" in audio_fields
         transcription = audio.transcription if transcription_present else None
@@ -506,14 +516,19 @@ class RealtimeConnection:
         if (
             self.asr_state.audio.received_bytes
             + target_samples * PCM_SAMPLE_WIDTH_BYTES
-            > self._current_max_item_bytes()
+            > self.asr_processor.max_buffer_bytes
         ):
-            await self._close_for_item_overflow()
+            await self._send_error_and_close(
+                "buffer_overflow",
+                "Audio item exceeded "
+                f"{self.asr_processor.max_buffer_bytes / self.bytes_per_second:g}s",
+                close_code=1009,
+            )
             return True
 
         if self.config.input_sample_rate != self.model_sample_rate:
             data = await asyncio.to_thread(
-                resample_to_target_rate,
+                _resample_to_target_rate,
                 data,
                 self.config.input_sample_rate,
                 self.model_sample_rate,
@@ -522,53 +537,11 @@ class RealtimeConnection:
         # A client may batch several chunks in one append; preserve the normal
         # inference cadence instead of turning that payload into one large call.
         while self.asr_processor.is_chunk_ready(self.asr_state):
-            audio = self.asr_state.audio
-            next_end_offset_bytes = min(
-                audio.received_bytes,
-                audio.last_attempted_offset_bytes + self.asr_processor.chunk_size_bytes,
-            )
-            # A windowed step can fall back to cumulative inference while this
-            # payload is draining, which narrows the per-item limit; recheck
-            # before each growth decode.
-            if next_end_offset_bytes > self._current_max_item_bytes():
-                await self._close_for_item_overflow()
-                return True
             ok = await self._run_inference(is_last=False)
             if not ok:
                 # WS already closed inside _run_inference.
                 return True
         return False
-
-    def _current_max_item_bytes(self) -> int:
-        return self.asr_processor.max_item_bytes(
-            self.config.language,
-            encoder_window_disabled=self.asr_state.encoder_window_disabled,
-        )
-
-    async def _close_for_item_overflow(self) -> None:
-        """Close 1009 ("message too big") so clients can distinguish
-        session-resource exhaustion from a normal close. Name the reason when
-        the cap is narrower than the buffer so clients know what to change."""
-        max_item_bytes = self._current_max_item_bytes()
-        if self.asr_state.encoder_window_disabled:
-            cap_hint = (
-                " (this item fell back to cumulative transcription mid-stream,"
-                " which lowers the per-item limit)"
-            )
-        elif max_item_bytes < self.asr_processor.max_buffer_bytes:
-            cap_hint = (
-                " (longer items require an explicitly supported "
-                "session.audio.input.transcription.language)"
-            )
-        else:
-            cap_hint = ""
-        await self._send_error_and_close(
-            "buffer_overflow",
-            "Accumulated audio exceeded "
-            f"{max_item_bytes / self.bytes_per_second:g}s; "
-            f"client is sending faster than inference can keep up{cap_hint}",
-            close_code=1009,
-        )
 
     async def _on_input_audio_buffer_commit(
         self, event: InputAudioBufferCommitEvent

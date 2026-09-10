@@ -223,7 +223,7 @@ class Serving:
     ] = "model"
     asr_max_buffer_seconds: A[
         int,
-        "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",
+        "Maximum total seconds of PCM audio received per realtime ASR audio item, including audio already processed or discarded from rolling context. Applies to all transcription modes and languages; exceeding it closes the session with a buffer_overflow error. Default 60s.",
     ] = 60
     asr_max_concurrent_sessions: A[
         int,
@@ -231,15 +231,15 @@ class Serving:
     ] = 32
     enable_asr_encoder_window: A[
         bool,
-        "Enable encoder-window rolling context for realtime ASR models that declare independently encodable audio windows. It activates only after the configured long-audio threshold (the adapter's default unless overridden), so raise --asr-max-buffer-seconds above that threshold. Models and languages without a declared policy stay cumulative. Experimental; not supported with disaggregation.",
+        "Enable encoder-window rolling context for realtime ASR models that declare independently encodable audio windows. It activates only after the configured long-audio threshold (the adapter's default unless overridden), so raise --asr-max-buffer-seconds above that threshold. Models and languages without a declared policy stay cumulative, with inference cost growing as the item grows. The total item limit remains --asr-max-buffer-seconds in all modes. Experimental; not supported with disaggregation.",
     ] = False
     asr_encoder_window_min_audio_seconds: A[
         Optional[float],
-        "Override the audio duration threshold for encoder-window realtime ASR. Must be finite and non-negative; activation is checked after the threshold, rounded up to an inference boundary. Raise --asr-max-buffer-seconds above that boundary. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+        "Override only the activation threshold for encoder-window realtime ASR, without changing the total item limit. Must be finite and non-negative; activation is checked after the threshold, rounded up to an inference boundary. Raise --asr-max-buffer-seconds above that boundary. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
     ] = None
     asr_encoder_window_max_context_windows: A[
         Optional[int],
-        "Override the number of complete encoder-native windows kept as rolling acoustic context in realtime ASR, plus the mutable tail. Must be positive. This does not change the model's native window size; fewer windows can reduce transcription accuracy. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+        "Override the target number of complete encoder-native windows kept as rolling acoustic context in realtime ASR, plus the mutable tail. Unconfirmed text can temporarily retain more audio, up to a bounded recovery limit. Must be positive. This does not change the model's native window size; fewer windows can reduce transcription accuracy. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
     ] = None
     asr_decoder_prefix_max_tokens: A[
         Optional[int],

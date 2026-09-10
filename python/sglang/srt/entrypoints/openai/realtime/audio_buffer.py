@@ -12,22 +12,6 @@ import numpy as np
 PCM_SAMPLE_WIDTH_BYTES = 2
 
 
-def resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
-    if src_rate == target_rate or not pcm:
-        return pcm
-    import torch
-    import torchaudio
-
-    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    audio = torch.from_numpy(samples).unsqueeze(0)
-    audio = torchaudio.functional.resample(
-        audio, orig_freq=src_rate, new_freq=target_rate
-    )
-    samples = audio.squeeze(0).numpy()
-    # Clip to int16 range via 2^15 - 1 so a clipped 1.0 stays representable.
-    return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-
-
 def pcm_to_float_samples(pcm: bytes) -> np.ndarray:
     # /32768.0 matches soundfile.read's default int16 normalization, so the
     # samples are bit-equal to the previous PCM -> WAV -> sf.read path.

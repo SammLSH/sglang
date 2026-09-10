@@ -221,8 +221,8 @@ class GenerateReqInput:
     # Optional request-scoped video processor configuration.
     video_config: Optional[Dict[str, Any]] = None
     # Optional request-scoped keyword arguments interpreted by the multimodal
-    # processor (for example an encoder-window geometry). Values must be plain
-    # JSON-compatible data; a processor validates only the keys it consumes.
+    # processor (for example windowing opt-in and leading audio context).
+    # Values must be JSON-compatible; a processor validates the keys it consumes.
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None

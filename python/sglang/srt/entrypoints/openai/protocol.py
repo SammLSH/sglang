@@ -2082,23 +2082,6 @@ class TranscriptionRequest(BaseModel):
     temperature: float = 0.0
     timestamp_granularities: Optional[List[str]] = None
     stream: bool = False
-    # Optional overrides for adapters supporting chunked HTTP streaming.
-    chunk_size_sec: Optional[float] = Field(
-        default=None,
-        gt=0,
-        allow_inf_nan=False,
-        description="Audio chunk duration in seconds. Must cover at least one input sample and produce at most 1024 chunks per upload. Unset uses the adapter default.",
-    )
-    unfixed_chunk_num: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="Initial chunks decoded without a transcript prefix. Unset uses the adapter default.",
-    )
-    unfixed_token_num: Optional[int] = Field(
-        default=None,
-        gt=0,
-        description="Trailing text units held back from confirmation (words for English). Unset uses the adapter default.",
-    )
     # Internal fields (not from API)
     audio_data: Optional[bytes] = None
     audio_duration_s: float = 0.0

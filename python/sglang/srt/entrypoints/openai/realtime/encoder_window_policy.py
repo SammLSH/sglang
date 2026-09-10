@@ -19,8 +19,8 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.multimodal.encoder_window import (
-    EncoderWindowCapability,
-    EncoderWindowConfig,
+    AudioWindowGeometry,
+    WindowedAudioProcessorMixin,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
     """Adapter policy paired with the model's resolved window geometry."""
 
-    config: EncoderWindowConfig
+    config: AudioWindowGeometry
     policy: RealtimeEncoderWindowPolicy
     # Data-parallel worker count the sessions are pinned across; 1 disables
     # pinning. Pinning keeps a session's window embeddings on one rank so the
@@ -79,7 +79,7 @@ def resolve_realtime_encoder_window_policy(
     so a misconfigured server fails at startup.
     """
     policy = adapter.realtime_encoder_window_policy
-    if policy is None or not isinstance(mm_processor, EncoderWindowCapability):
+    if policy is None or not isinstance(mm_processor, WindowedAudioProcessorMixin):
         logger.warning(
             "[realtime] --enable-asr-encoder-window is set but the model or its "
             "transcription adapter does not declare encoder windowing; realtime "
@@ -106,7 +106,7 @@ def resolve_realtime_encoder_window_policy(
             "encoder-window ASR requires a tokenizer for the decoder prefix"
         )
 
-    config = mm_processor.encoder_window_config()
+    config = mm_processor.audio_window_geometry()
     if config.sample_rate != adapter.model_sample_rate:
         raise ValueError(
             f"feature extractor sample rate {config.sample_rate} differs from the "

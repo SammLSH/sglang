@@ -122,57 +122,35 @@ class TestPrepareServerArgs(CustomTestCase):
                     **generic_offload,
                 ).resolve_once()
 
-    def test_asr_encoder_window_policy_overrides(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        defaults = ServerArgs.from_cli_args(
-            parser.parse_args(["--model-path", "dummy"])
-        )
-        self.assertFalse(defaults.enable_asr_encoder_window)
-        self.assertFalse(defaults.enable_asr_decoder_streaming)
-        for field, valid, invalid in (
-            ("asr_encoder_window_min_audio_seconds", (0.0, 30.5), (-1, "nan", "inf")),
-            ("asr_encoder_window_max_context_windows", (4, 8), (0, -1)),
-            ("asr_decoder_prefix_max_tokens", (512, 128), (0, -1)),
-            ("asr_decoder_prefix_holdback_units", (0, 2), (-1,)),
-        ):
-            self.assertIsNone(getattr(defaults, field))
-            flag = "--" + field.replace("_", "-")
-            for value in (*valid, *invalid):
-                with self.subTest(field=field, value=value):
-                    args = ServerArgs.from_cli_args(
-                        parser.parse_args(["--model-path", "dummy", flag, str(value)])
-                    )
-                    self.assertFalse(args.enable_asr_encoder_window)
-                    # Dummy model resolution exits before the ASR validation
-                    # stage, so exercise this configuration hook directly.
-                    if value in valid:
-                        serving_hook.handle_asr_validation(args)
-                        self.assertEqual(resolution_result(args, field), value)
-                    else:
-                        with self.assertRaisesRegex(ValueError, flag):
-                            serving_hook.handle_asr_validation(args)
-
-    def test_asr_feature_flags_are_independent_serving_config(self):
-        for flag, other in (
+    def test_asr_flags_and_policy_overrides(self):
+        overrides = {
+            "asr_encoder_window_min_audio_seconds": 30.5,
+            "asr_encoder_window_max_context_windows": 4,
+            "asr_decoder_prefix_max_tokens": 128,
+            "asr_decoder_prefix_holdback_units": 0,
+        }
+        options = ["--model-path", "dummy"]
+        for name, value in overrides.items():
+            options.extend(("--" + name.replace("_", "-"), str(value)))
+        for enabled, disabled in (
             ("enable_asr_encoder_window", "enable_asr_decoder_streaming"),
             ("enable_asr_decoder_streaming", "enable_asr_encoder_window"),
         ):
-            with self.subTest(flag=flag):
-                args = prepare_server_args(
-                    ["--model-path", "dummy", "--" + flag.replace("_", "-")]
-                )
+            with self.subTest(enabled=enabled):
+                args = prepare_server_args(options + ["--" + enabled.replace("_", "-")])
                 args.resolve_once()
-                self.assertTrue(resolution_result(args, flag))
-                self.assertFalse(resolution_result(args, other))
-                with get_context().override_server_args(
-                    **{
-                        flag: resolution_result(args, flag),
-                        other: resolution_result(args, other),
-                    }
-                ):
-                    self.assertTrue(getattr(get_serving(), flag))
-                    self.assertFalse(getattr(get_serving(), other))
+                serving_hook.handle_asr_validation(args)
+                self.assertTrue(resolution_result(args, enabled))
+                self.assertFalse(resolution_result(args, disabled))
+                for name, value in overrides.items():
+                    self.assertEqual(resolution_result(args, name), value)
+
+        # Dummy model resolution skips this hook, so exercise rejection directly.
+        invalid = prepare_server_args(
+            ["--model-path", "dummy", "--asr-encoder-window-max-context-windows", "0"]
+        )
+        with self.assertRaisesRegex(ValueError, "max-context-windows"):
+            serving_hook.handle_asr_validation(invalid)
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(

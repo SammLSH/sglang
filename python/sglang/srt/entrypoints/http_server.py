@@ -1819,14 +1819,6 @@ async def openai_v1_audio_transcriptions(
     timestamp_granularities: Optional[List[str]] = Form(
         default=None, alias="timestamp_granularities[]"
     ),
-    chunk_size_sec: Optional[float] = Form(
-        default=None,
-        gt=0,
-        allow_inf_nan=False,
-        description="Audio chunk duration in seconds. Must cover at least one input sample and produce at most 1024 chunks per upload. Unset uses the adapter default.",
-    ),
-    unfixed_chunk_num: Optional[int] = Form(default=None, ge=0),
-    unfixed_token_num: Optional[int] = Form(default=None, gt=0),
 ):
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
@@ -1850,9 +1842,6 @@ async def openai_v1_audio_transcriptions(
             temperature=temperature,
             stream=stream,
             timestamp_granularities=timestamp_granularities,
-            chunk_size_sec=chunk_size_sec,
-            unfixed_chunk_num=unfixed_chunk_num,
-            unfixed_token_num=unfixed_token_num,
             raw_request=raw_request,
         )
     )

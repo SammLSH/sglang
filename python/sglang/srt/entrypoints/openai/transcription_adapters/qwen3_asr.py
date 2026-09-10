@@ -27,6 +27,7 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def chunked_streaming_config(self) -> dict:
         # Qwen3-ASR paper (arXiv:2601.21337), Table 8 uses 4 unfixed chunks.
         # We use 2 here for lower latency; tune based on quality needs.
+        # TODO: allow users to override these via API request parameters.
         return {
             "chunk_size_sec": 2.0,
             "unfixed_chunk_num": 2,
@@ -43,8 +44,8 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
             # Equals the default --asr-max-buffer-seconds, so windowing stays
             # dormant until an operator raises the per-item cap.
             min_audio_sec=60.0,
-            # Six encoder-native 8 s windows (48 s) of rolling acoustic
-            # context per request; older speech is carried by the prefix.
+            # Target six native 8 s windows (48 s) of rolling context;
+            # unconfirmed text temporarily retains additional audio.
             max_audio_context_windows=6,
             # Default recent-text budget, overridable at server startup.
             decoder_prefix_max_tokens=192,
