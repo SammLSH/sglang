@@ -7,18 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import RealtimeErrorEvent
 from openai.types.realtime.realtime_error import RealtimeError
 
-from sglang.srt.entrypoints.openai.realtime.audio_buffer import PCM_SAMPLE_WIDTH_BYTES
 from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
     ResolvedEncoderWindowPolicy,
 )
-from sglang.srt.entrypoints.openai.realtime.protocol import SUPPORTED_INPUT_SAMPLE_RATES
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeASRSession
 from sglang.srt.entrypoints.openai.realtime.transport import WebSocketRealtimeTransport
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
@@ -30,6 +27,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
+
+# Preserve the original default queue budget: 60 s * 48,000 samples/s *
+# 2 bytes/sample (PCM16) * 2 for base64/JSON overhead = 11,520,000 bytes.
+# Keep this fixed so raising the item duration limit does not grow the backlog.
+_MAX_PENDING_INPUT_BYTES = 11_520_000
 
 
 async def _safe_send(websocket: WebSocket, text: str) -> None:
@@ -134,15 +136,8 @@ async def handle_realtime_transcription(
             except (WebSocketDisconnect, RuntimeError) as e:
                 logger.debug("[realtime] accept failed: %s", e)
                 return
-            # Budget input at the highest wire sample rate, with room for
-            # base64/JSON overhead, before resampling to the model rate.
-            max_input_pcm_bytes = math.ceil(
-                get_serving().asr_max_buffer_seconds
-                * max(SUPPORTED_INPUT_SAMPLE_RATES)
-                * PCM_SAMPLE_WIDTH_BYTES
-            )
             transport = WebSocketRealtimeTransport(
-                websocket, max_pending_bytes=max(4096, 2 * max_input_pcm_bytes)
+                websocket, max_pending_bytes=_MAX_PENDING_INPUT_BYTES
             )
             session = RealtimeASRSession(
                 transport,

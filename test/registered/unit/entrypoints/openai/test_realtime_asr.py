@@ -431,10 +431,91 @@ class TestRealtimeASR(CustomTestCase):
             )
             self.assertEqual(len(manager.requests), 1)
 
-    def test_failed_preview_does_not_commit_state(self):
+    def test_publication_uses_one_snapshot_through_preview_final_and_flush(self):
+        for window, scripts, expected_prefix, expected in (
+            (
+                False,
+                [["one two"], ["one two"], [" two three four", " two three four five"]],
+                "one",
+                "one two three four five",
+            ),
+            (
+                True,
+                [
+                    ["one two three four"],
+                    ["one two three four"],
+                    [" five six seven", " five six seven eight"],
+                    [" five six seven eight nine", " five six seven eight nine ten"],
+                ],
+                "two three four",
+                "one two three four five six seven eight nine ten",
+            ),
+            (
+                False,
+                [["two three four", "twofold three four"]],
+                "",
+                "twofold three four",
+            ),
+        ):
+            with self.subTest(window=window, expected=expected):
+                manager, connection = _connection(
+                    scripts, window=window, streaming=True
+                )
+                for _ in scripts:
+                    event = SimpleNamespace(audio=base64.b64encode(bytes(4)).decode())
+                    self.assertFalse(
+                        _run(connection._on_input_audio_buffer_append(event))
+                    )
+                    self.assertEqual(
+                        connection.asr_state.emitted_text,
+                        "".join(e.delta for e in _events(connection, ".delta")),
+                    )
+                self.assertEqual(manager.requests[-1].text, "PROMPT:" + expected_prefix)
+                _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+                self.assertEqual(len(manager.requests), len(scripts))
+                self.assertEqual(
+                    "".join(e.delta for e in _events(connection, ".delta")), expected
+                )
+                self.assertEqual(
+                    _events(connection, ".completed")[0].transcript, expected
+                )
+
+    def test_failed_send_records_only_successfully_published_text(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                _, connection = _connection(
+                    [["one two three", "one two three four"]], streaming=streaming
+                )
+                delivered = []
+
+                async def send(event):
+                    if event.type.endswith(".delta"):
+                        if len(delivered) == int(streaming):
+                            raise ConnectionError(
+                                "peer disconnected during publication"
+                            )
+                        delivered.append(event.delta)
+
+                connection.transport.send.side_effect = send
+                event = SimpleNamespace(audio=base64.b64encode(bytes(4)).decode())
+                with self.assertLogs(level="ERROR"):
+                    self.assertTrue(
+                        _run(connection._on_input_audio_buffer_append(event))
+                    )
+                self.assertEqual(
+                    connection.asr_state.emitted_text, "one" if streaming else ""
+                )
+                self.assertEqual(connection.asr_state.emitted_text, "".join(delivered))
+                self.assertEqual(connection.asr_state.transcript.full_transcript, "")
+                self.assertEqual(
+                    connection.asr_state.audio.last_processed_offset_bytes, 0
+                )
+                connection.transport.finish.assert_awaited_once_with("server_error")
+
+    def test_failed_preview_preserves_sent_text_but_not_candidate_or_audio(self):
         for window, frames in (
             (True, ["four five six", "four five six seven", "four five five seven"]),
-            (False, ["two three four", "twofold three four"]),
+            (False, ["two three four", "too three four"]),
             (True, ["four five six", ("four five six seven", {"type": "length"})]),
             (True, ["four five six", ("", {"type": "abort", "status_code": 500})]),
         ):
@@ -444,18 +525,23 @@ class TestRealtimeASR(CustomTestCase):
                     _activate(connection)
                 state = connection.asr_state
                 transcript_before = vars(state.transcript).copy()
+                emitted_before = state.emitted_text
                 state.audio.append_pcm(bytes(4))
                 published = []
                 with self.assertRaises(RuntimeError):
                     _step(connection, published=published)
                 self.assertTrue(published)
-                self.assertEqual(vars(state.transcript), transcript_before)
+                self.assertEqual(
+                    state.emitted_text, emitted_before + "".join(published)
+                )
+                transcript_after = vars(state.transcript).copy()
+                transcript_after["emitted_text"] = transcript_before["emitted_text"]
+                self.assertEqual(transcript_after, transcript_before)
                 self.assertEqual(state.audio.last_attempted_offset_bytes, 0)
                 self.assertEqual(state.audio.last_processed_offset_bytes, 0)
                 self.assertEqual(state.audio.base_offset_bytes, 0)
                 self.assertEqual(bytes(state.audio.data), bytes(4))
                 if window:
-                    self.assertEqual(state.emitted_text, "one two three")
                     self.assertEqual(state.decoder_suffix.pending, "four five six")
 
     def test_item_audio_limit_still_applies_after_window_fallback(self):
@@ -528,7 +614,7 @@ class TestRealtimeASR(CustomTestCase):
         self.assertFalse(state.has_new_audio)
         self.assertEqual(manager.requests[-1].text, "PROMPT:one two three")
         self.assertEqual(state.emitted_text, "one two three one two three four")
-        self.assertEqual(" ".join(published), "one two three four")
+        self.assertEqual("".join(published), " one two three four")
 
     def test_invalid_payload_clears_previous_client_event_id(self):
         _, connection = _connection([])
@@ -586,6 +672,7 @@ class TestRealtimeASR(CustomTestCase):
             )
 
             def bind_transport(transport, *args, **kwargs):
+                self.assertEqual(transport._max_pending_bytes, 11_520_000)
                 transport._max_pending_bytes = 1024
                 connection.transport = transport
                 return connection
@@ -654,8 +741,15 @@ class TestRealtimeASR(CustomTestCase):
                         task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
-        for exit_reason in ("disconnect", "overflow", "cancel"):
-            with self.subTest(exit_reason=exit_reason):
+        for exit_reason, item_limit in (
+            ("disconnect", 60),
+            ("overflow", 600),
+            ("cancel", 3600),
+        ):
+            with (
+                self.subTest(exit_reason=exit_reason),
+                get_context().override_server_args(asr_max_buffer_seconds=item_limit),
+            ):
                 _run(run(exit_reason))
 
 

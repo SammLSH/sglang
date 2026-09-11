@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pybase64
@@ -69,10 +69,6 @@ from sglang.srt.entrypoints.openai.realtime.protocol import (
 from sglang.srt.entrypoints.openai.realtime.transport import (
     FinishReason,
     RealtimeTransport,
-)
-from sglang.srt.entrypoints.openai.streaming_asr import (
-    needs_space,
-    normalize_whitespace,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -133,14 +129,12 @@ class _SessionConfig:
 
 @dataclass
 class _ItemState:
-    """Per-item conversation-item ids and the wire-formatted deltas
-    emitted so far for the current item. current_item_id is reserved at
+    """Per-item conversation ids. current_item_id is reserved at
     __init__ and only announced to the client by
     input_audio_buffer.committed."""
 
     current_item_id: str
     previous_item_id: Optional[str] = None
-    emitted_deltas: List[str] = field(default_factory=list)
 
 
 class RealtimeASRSession:
@@ -469,7 +463,7 @@ class RealtimeASRSession:
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
 
-        partial_transcript = normalize_whitespace("".join(self.item.emitted_deltas))
+        partial_transcript = self.asr_state.emitted_text
 
         await self._send(
             InputAudioBufferCommittedEvent(
@@ -504,22 +498,12 @@ class RealtimeASRSession:
             self.asr_state.audio.received_bytes / self.bytes_per_second
         )
 
-        if has_new_audio:
+        if has_new_audio or self.asr_state.has_transcript:
             ok = await self._run_inference(is_last=True)
             if not ok:
                 # _run_inference already emitted transcription.failed and
                 # rolled the item; don't also emit completed.
                 return
-        elif self.asr_state.has_transcript:
-            # Audio length was exactly a chunk_size_bytes multiple. Flush
-            # the tail tokens update() held back.
-            await self._emit_transcription_delta(
-                self.asr_processor.flush_pending_transcript(self.asr_state)
-            )
-
-        # Build from emitted_deltas, not state.full_transcript: prefix injection
-        # means the last chunk's full_transcript is only the continuation tail.
-        transcript = normalize_whitespace("".join(self.item.emitted_deltas))
 
         await self._send(
             ConversationItemInputAudioTranscriptionCompletedEvent(
@@ -527,7 +511,7 @@ class RealtimeASRSession:
                 type="conversation.item.input_audio_transcription.completed",
                 item_id=item_id,
                 content_index=0,
-                transcript=transcript,
+                transcript=self.asr_state.emitted_text,
                 usage=UsageTranscriptTextUsageDuration(
                     type="duration", seconds=pcm_duration_seconds
                 ),
@@ -557,17 +541,18 @@ class RealtimeASRSession:
         commit-time emits transcription.failed and rolls the item; append-time
         emits a generic error envelope and finishes the stream."""
         try:
-            delta = await self.asr_processor.process(
-                self.asr_state,
-                is_last=is_last,
-                language=self.config.language,
-                sampling_params=self.config.sampling_params,
-                on_transcript_delta=(
-                    self._emit_transcription_delta
-                    if self.asr_processor.decoder_streaming
-                    else None
-                ),
-            )
+            if is_last and not self.asr_state.has_new_audio:
+                await self.asr_processor.flush_pending_transcript(
+                    self.asr_state, self._emit_transcription_delta
+                )
+            else:
+                await self.asr_processor.process(
+                    self.asr_state,
+                    is_last=is_last,
+                    language=self.config.language,
+                    sampling_params=self.config.sampling_params,
+                    on_transcript_delta=self._emit_transcription_delta,
+                )
         except Exception:
             logger.exception(
                 "[realtime] inference failed: session=%s item=%s buffer_bytes=%d",
@@ -576,11 +561,8 @@ class RealtimeASRSession:
                 len(self.asr_state.audio.data),
             )
             if is_last:
-                # Commit-time failure: committed + created already emitted,
-                # so the item exists client-side and transcription.failed
-                # can reference it. Wire message is hardcoded "Transcription
-                # failed" — don't leak backend traces to the client; full
-                # error is in the logger.exception above.
+                # committed + created already announced this item. Keep
+                # backend details in the log, outside the client error.
                 await self._send(
                     ConversationItemInputAudioTranscriptionFailedEvent(
                         event_id=f"event_{random_uuid()}",
@@ -606,30 +588,19 @@ class RealtimeASRSession:
                 )
             return False
 
-        await self._emit_transcription_delta(delta)
         return True
 
     async def _emit_transcription_delta(self, delta: str) -> None:
-        """emitted_deltas stores wire-formatted text (with leading
-        boundary spaces baked in), so "".join(...) reconstructs the
-        cumulative transcript verbatim."""
-        if not delta:
-            return
-        for word in delta.split(" "):
-            if not word:
-                continue
-            prev = self.item.emitted_deltas[-1] if self.item.emitted_deltas else ""
-            formatted = f" {word}" if needs_space(prev, word) else word
-            self.item.emitted_deltas.append(formatted)
-            await self._send(
-                ConversationItemInputAudioTranscriptionDeltaEvent(
-                    event_id=f"event_{random_uuid()}",
-                    type="conversation.item.input_audio_transcription.delta",
-                    item_id=self.item.current_item_id,
-                    content_index=0,
-                    delta=formatted,
-                )
+        """Wrap the processor's exact append string without reformatting."""
+        await self._send(
+            ConversationItemInputAudioTranscriptionDeltaEvent(
+                event_id=f"event_{random_uuid()}",
+                type="conversation.item.input_audio_transcription.delta",
+                item_id=self.item.current_item_id,
+                content_index=0,
+                delta=delta,
             )
+        )
 
     def _start_next_item(self) -> None:
         self.item.previous_item_id = self.item.current_item_id
@@ -639,7 +610,6 @@ class RealtimeASRSession:
     def _reset_inference_state(self) -> None:
         """Missing any of these resets leaks state across items."""
         self.asr_state = self.asr_processor.create_state()
-        self.item.emitted_deltas.clear()
 
     def _build_session_info(self) -> TranscriptionSessionConfig:
         # id / object aren't SDK fields; round-trip via extra='allow' so
