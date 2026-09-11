@@ -12,6 +12,10 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# Conservative per-frame bookkeeping budget; even empty frames consume queue
+# capacity. This is an accounting allowance, not a measured Python object size.
+_QUEUED_FRAME_OVERHEAD_BYTES = 256
+
 FinishReason = Literal["normal", "buffer_overflow", "server_error"]
 
 
@@ -58,7 +62,7 @@ class WebSocketRealtimeTransport:
             size = (
                 len((message.get("text") or "").encode("utf-8"))
                 + len(message.get("bytes") or b"")
-                + 256
+                + _QUEUED_FRAME_OVERHEAD_BYTES
             )
             if self._pending_input_bytes + size > self._max_pending_bytes:
                 # Waiting for queue space would hide disconnects behind audio.

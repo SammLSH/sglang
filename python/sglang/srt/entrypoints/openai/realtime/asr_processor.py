@@ -8,10 +8,9 @@ Per-chunk flow, driven by the endpoint::
 
     append audio -> is_chunk_ready()? -> process()
         _build_transcription_step  resolve mode, audio range, and prompt
-        _execute_*_step            compute candidate text without changing state
+        _execute_*_step            reconcile candidates; optionally publish previews
         preview.remaining         validate the final candidate against sent text
         _commit_outcome            adopt text, advance cursors, compact old PCM
-    -> transcript delta
     commit event -> process(is_last=True), or flush_pending_transcript()
                     if no new audio
 
@@ -49,11 +48,8 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     ASRBackendAborted,
     StreamingASRState,
     apply_cumulative_transcript,
-    common_unit_prefix,
     generate_asr_transcript,
     join_text,
-    join_units,
-    needs_space,
     normalize_whitespace,
     split_units,
 )
@@ -238,9 +234,9 @@ class RealtimeASRProcessor:
         is_last: bool,
         language: Optional[str],
         sampling_params: Dict[str, Any],
-        on_transcript_delta: Optional[_TranscriptDeltaCallback] = None,
-    ) -> str:
-        """Run one step, publish accepted text and return the final wire delta.
+        on_transcript_delta: _TranscriptDeltaCallback,
+    ) -> None:
+        """Run one step and publish accepted text through the callback.
 
         Every delta uses the same callback, including the final remainder.
         Decoder streaming also publishes previews while generation runs.
@@ -256,7 +252,7 @@ class RealtimeASRProcessor:
         step = self._build_transcription_step(state, is_last, language)
         publication = _StreamPreview(prefix=state.emitted_text)
         preview = None
-        if on_transcript_delta is not None and self.decoder_streaming and not is_last:
+        if self.decoder_streaming and not is_last:
             preview = publication
         execute_step = (
             self._execute_encoder_window_step
@@ -271,13 +267,12 @@ class RealtimeASRProcessor:
             raise RuntimeError("completed ASR decode revised already streamed text")
         await self._publish_delta(state, remaining, on_transcript_delta)
         self._commit_outcome(state, step, outcome)
-        return remaining
 
     async def flush_pending_transcript(
         self,
         state: RealtimeASRState,
-        on_transcript_delta: Optional[_TranscriptDeltaCallback] = None,
-    ) -> str:
+        on_transcript_delta: _TranscriptDeltaCallback,
+    ) -> None:
         """Emit text still held back when the item commits without new audio."""
         transcript = copy(state.decoder_suffix or state.transcript)
         delta = (
@@ -289,12 +284,13 @@ class RealtimeASRProcessor:
         if delta is None:
             raise RuntimeError("ASR flush revised already published text")
         await self._publish_delta(state, delta, on_transcript_delta)
-        transcript.emitted_text = state.emitted_text
         if state.decoder_suffix is not None:
-            state.decoder_suffix = transcript
+            state.decoder_suffix.pending = transcript.pending
+            state.decoder_suffix.confirmed_pending_chars = (
+                transcript.confirmed_pending_chars
+            )
         else:
-            state.transcript = transcript
-        return delta
+            state.transcript.accept_candidate(transcript)
 
     # ---- step construction -------------------------------------------------
 
@@ -337,7 +333,7 @@ class RealtimeASRProcessor:
             suffix_state = DecoderSuffixState(
                 emitted_text=state.transcript.emitted_text
             )
-            handoff_pending = _cumulative_unpublished_text(state.transcript)
+            handoff_pending = state.transcript.unpublished_text(split_cjk=True)
             start_offset_bytes = 0
         else:
             suffix_state = state.decoder_suffix
@@ -434,7 +430,7 @@ class RealtimeASRProcessor:
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
         preview: Optional[_StreamPreview],
-        on_transcript_delta: Optional[_TranscriptDeltaCallback],
+        on_transcript_delta: _TranscriptDeltaCallback,
     ) -> _TranscriptionOutcome:
         """Re-transcribe accumulated audio and reconcile its cumulative text."""
         transcript_before = copy(state.transcript)
@@ -510,7 +506,7 @@ class RealtimeASRProcessor:
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
         preview: Optional[_StreamPreview],
-        on_transcript_delta: Optional[_TranscriptDeltaCallback],
+        on_transcript_delta: _TranscriptDeltaCallback,
     ) -> _TranscriptionOutcome:
         """Decode the continuation of encoder-aligned rolling context."""
         policy = self.encoder_window
@@ -632,10 +628,9 @@ class RealtimeASRProcessor:
         state: RealtimeASRState,
         preview: _StreamPreview,
         candidate: str,
-        on_transcript_delta: Optional[_TranscriptDeltaCallback],
+        on_transcript_delta: _TranscriptDeltaCallback,
     ) -> None:
         """Publish only compatible extensions; the final candidate decides acceptance."""
-        assert on_transcript_delta is not None
         extra = preview.remaining(candidate)
         if not extra:
             return
@@ -646,13 +641,12 @@ class RealtimeASRProcessor:
         self,
         state: RealtimeASRState,
         delta: str,
-        on_transcript_delta: Optional[_TranscriptDeltaCallback],
+        on_transcript_delta: _TranscriptDeltaCallback,
     ) -> None:
         """Record exact wire text only after the send succeeds."""
         if not delta:
             return
-        if on_transcript_delta is not None:
-            await on_transcript_delta(delta)
+        await on_transcript_delta(delta)
         transcript = state.decoder_suffix or state.transcript
         transcript.emitted_text += delta
 
@@ -693,8 +687,7 @@ class RealtimeASRProcessor:
             return
         state.deferred_empty_continuation = outcome.deferred_empty
         if outcome.transcript is not None:
-            outcome.transcript.emitted_text = state.emitted_text
-            state.transcript = outcome.transcript
+            state.transcript.accept_candidate(outcome.transcript)
         if outcome.suffix_update is not None:
             state.consecutive_window_failures = 0
             update = outcome.suffix_update
@@ -717,18 +710,3 @@ class RealtimeASRProcessor:
             audio.discard_before(
                 max(0, step.start_offset_bytes - self.encoder_window.context_bytes)
             )
-
-
-def _cumulative_unpublished_text(transcript: StreamingASRState) -> str:
-    """Cumulative text after the published boundary, ready for handoff."""
-    full = join_text("", transcript.full_transcript)
-    confirmed = transcript.confirmed_text
-    if full.startswith(transcript.emitted_text):
-        confirmed = transcript.emitted_text
-        remainder = full[len(transcript.emitted_text) :]
-        if not remainder or not needs_space(transcript.emitted_text, remainder):
-            return remainder.lstrip(" ")
-    confirmed_units = split_units(confirmed)
-    full_units = split_units(transcript.full_transcript)
-    common = common_unit_prefix(confirmed_units, full_units)
-    return join_units(full_units[common:])

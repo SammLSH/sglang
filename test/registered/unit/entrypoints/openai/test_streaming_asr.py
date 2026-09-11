@@ -18,6 +18,7 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
     apply_cumulative_transcript,
     generate_asr_transcript,
+    join_text,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,16 +26,24 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def _publish(state, delta):
+    state.emitted_text = join_text(state.emitted_text, delta)
+    return delta
+
+
 class TestStreamingASRState(CustomTestCase):
     def test_holdback_and_revision_without_prefix(self):
         state = StreamingASRState(2.0, 2, 1)
-        self.assertEqual(state.update("one two three"), "one two")
-        self.assertEqual(state.update("one two three four"), "three")
+        self.assertEqual(_publish(state, state.update("one two three")), "one two")
+        self.assertEqual(_publish(state, state.update("one two three four")), "three")
         self.assertEqual(state.get_prefix_text(), "one two three")
         self.assertEqual(state.finalize(), "four")
         state = StreamingASRState(2.0, 3, 1)
         self.assertEqual(
-            [state.update(text) for text in ("a tail", "b tail", "b tail")],
+            [
+                _publish(state, state.update(text))
+                for text in ("a tail", "b tail", "b tail")
+            ],
             ["a", "b", ""],
         )
         self.assertEqual(state.finalize(), "tail")
@@ -45,9 +54,11 @@ class TestStreamingASRState(CustomTestCase):
 
     def test_punctuation_remainder_does_not_repeat_the_published_word(self):
         state = StreamingASRState(2.0, 2, 1)
-        self.assertEqual(state.update("Hello pending"), "Hello")
+        self.assertEqual(_publish(state, state.update("Hello pending")), "Hello")
         delta = apply_cumulative_transcript(state, "Hello,  world", is_last=True)
         self.assertEqual(delta, ", world")
+        self.assertEqual(state.emitted_text, "Hello")
+        _publish(state, delta)
         self.assertEqual(state.emitted_text, "Hello" + delta)
         self.assertEqual(state.finalize(), "")
 
@@ -62,7 +73,12 @@ class TestStreamingASRState(CustomTestCase):
             suffix = "" if count == 5 else reference[len(prefix) :]
             suffixes.append(suffix)
             deltas.append(
-                apply_cumulative_transcript(state, prefix + suffix, is_last=count == 6)
+                _publish(
+                    state,
+                    apply_cumulative_transcript(
+                        state, prefix + suffix, is_last=count == 6
+                    ),
+                )
             )
         self.assertEqual(suffixes[2], suffixes[3])
         self.assertEqual(state.emitted_text, reference)

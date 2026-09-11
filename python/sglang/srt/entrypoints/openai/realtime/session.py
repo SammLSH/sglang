@@ -74,7 +74,6 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
@@ -145,13 +144,11 @@ class RealtimeASRSession:
         transport: RealtimeTransport,
         tokenizer_manager: TokenizerManager,
         adapter: TranscriptionAdapter,
-        server_args: ServerArgs,
         encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
     ) -> None:
         self.transport = transport
         self.tokenizer_manager = tokenizer_manager
         self.adapter = adapter
-        self.server_args = server_args
 
         self.session_id = f"sess_{random_uuid()}"
         self._current_client_event_id: Optional[str] = None

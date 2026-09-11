@@ -17,9 +17,6 @@ maybe_stub_sgl_kernel()
 import numpy as np
 from fastapi import WebSocket
 
-from sglang.srt.entrypoints.openai.realtime.asr_processor import (
-    _cumulative_unpublished_text,
-)
 from sglang.srt.entrypoints.openai.realtime.decoder_suffix import DecoderSuffixState
 from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
     ResolvedEncoderWindowPolicy,
@@ -36,7 +33,7 @@ from sglang.srt.multimodal.encoder_window import (
     AudioEncoderWindowConfig,
     build_audio_window_processor_kwargs,
 )
-from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_override
@@ -126,7 +123,6 @@ def _connection(
         Mock(receive=AsyncMock(), send=AsyncMock(), finish=AsyncMock()),
         manager,
         adapter,
-        get_server_args(),
         encoder_window=_policy(threshold) if window else None,
     )
     connection.config.configured = True
@@ -137,18 +133,23 @@ def _connection(
 
 
 def _step(connection, *, language="en", is_last=False, published=None):
-    async def collect(text):
-        published.append(text)
+    deltas = []
 
-    return _run(
+    async def collect(text):
+        deltas.append(text)
+        if published is not None:
+            published.append(text)
+
+    _run(
         connection.asr_processor.process(
             connection.asr_state,
             language=language,
             is_last=is_last,
             sampling_params=connection.config.sampling_params,
-            on_transcript_delta=collect if published is not None else None,
+            on_transcript_delta=collect,
         )
     )
+    return "".join(deltas)
 
 
 def _activate(connection, pending="four five six"):
@@ -222,11 +223,11 @@ class TestRealtimeASR(CustomTestCase):
         transcript = copy(connection.asr_state.transcript)
         transcript.emitted_text = "Hello"
         transcript.full_transcript = "Hello,  world"
-        self.assertEqual(_cumulative_unpublished_text(transcript), ", world")
+        self.assertEqual(transcript.unpublished_text(split_cjk=True), ", world")
         # A rejected mid-word extension retains the old fallback origin.
         transcript.emitted_text = "one two"
         transcript.full_transcript = "one twofold three"
-        self.assertEqual(_cumulative_unpublished_text(transcript), "twofold three")
+        self.assertEqual(transcript.unpublished_text(split_cjk=True), "twofold three")
         # Two complete chunks, then one real sample handled by commit.
         for size in (4, 4, 2):
             _run(
@@ -687,7 +688,6 @@ class TestRealtimeASR(CustomTestCase):
                         websocket,
                         manager,
                         connection.adapter,
-                        get_server_args(),
                         semaphore,
                     )
                 )

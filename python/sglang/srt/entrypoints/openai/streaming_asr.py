@@ -56,13 +56,14 @@ class StreamingASRState:
             return ""
         return self.emitted_text
 
-    def _record_emit(self, delta: str) -> str:
-        delta = join_text("", delta)
-        if delta:
-            self.emitted_text = join_text(self.emitted_text, delta)
-        return delta
+    def accept_candidate(self, candidate: "StreamingASRState") -> None:
+        """Adopt a reconciled hypothesis, preserving text actually published."""
+        self.confirmed_text = candidate.confirmed_text
+        self.full_transcript = candidate.full_transcript
+        self.chunk_index = candidate.chunk_index
 
     def update(self, new_transcript: str) -> str:
+        """Update the candidate hypothesis; the caller publishes the delta."""
         # A shorter continuation can move holdback into the supplied prefix.
         # Keep that published boundary when it belongs to this hypothesis.
         old_confirmed = (
@@ -78,19 +79,21 @@ class StreamingASRState:
         self.full_transcript = new_transcript
         self.chunk_index += 1
         if self.confirmed_text.startswith(old_confirmed):
-            return self._record_emit(self.confirmed_text[len(old_confirmed) :].strip())
+            return join_text("", self.confirmed_text[len(old_confirmed) :].strip())
         # Model revised earlier text, use word level common prefix to avoid
         # re-emitting already-sent content and cutting mid-word.
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
-        common_count = 0
-        for ow, nw in zip(old_words, new_words):
-            if ow != nw:
-                break
-            common_count += 1
-        return self._record_emit(" ".join(new_words[common_count:]))
+        common_count = common_unit_prefix(old_words, new_words)
+        return join_text("", " ".join(new_words[common_count:]))
 
-    def finalize(self) -> str:
+    def unpublished_text(self, *, split_cjk: bool = False) -> str:
+        """Read the candidate tail without publishing or changing state.
+
+        Cumulative finalization retains its whitespace-word rollback. Window
+        handoff splits CJK runs into text units, as suffix agreement does.
+        Both use the same exact published boundary and word-extension guard.
+        """
         text = join_text("", self.full_transcript)
         confirmed = self.confirmed_text
         if text.startswith(self.emitted_text):
@@ -99,21 +102,24 @@ class StreamingASRState:
             # Preserve punctuation added after the published word, without
             # allowing an extension that the wire would split mid-word.
             if not remainder or not needs_space(confirmed, remainder):
-                self.confirmed_text = text
-                return self._record_emit(remainder)
-        confirmed_words = confirmed.split()
-        all_words = text.split()
-        # Use word level common prefix to handle punctuation differences
-        # between intermediate chunks and the final full transcription.
-        common_count = 0
-        for cw, aw in zip(confirmed_words, all_words):
-            if cw != aw:
-                break
-            common_count += 1
-        self.confirmed_text = text
-        if common_count == 0 and confirmed_words and all_words:
-            return self._record_emit(text)
-        return self._record_emit(" ".join(all_words[common_count:]))
+                return remainder.lstrip(" ")
+        if split_cjk:
+            confirmed_units = split_units(confirmed)
+            full_units = split_units(self.full_transcript)
+        else:
+            confirmed_units = confirmed.split()
+            full_units = text.split()
+        common = common_unit_prefix(confirmed_units, full_units)
+        if not split_cjk and common == 0 and confirmed_units and full_units:
+            return text
+        tail = full_units[common:]
+        return join_units(tail) if split_cjk else " ".join(tail)
+
+    def finalize(self) -> str:
+        """Finalize the hypothesis; publishing and recording remain separate."""
+        delta = join_text("", self.unpublished_text())
+        self.confirmed_text = join_text("", self.full_transcript)
+        return delta
 
 
 def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:

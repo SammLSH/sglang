@@ -752,9 +752,6 @@ class OpenAIServingTranscription(OpenAIServingBase):
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
         state = StreamingASRState(**self._adapter.chunked_streaming_config)
-        # Track only the trailing char of the cumulative emit; `needs_space`
-        # uses prev[-1] / cur[0] so we don't need to keep the full buffer.
-        last_char = ""
 
         try:
             chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
@@ -780,8 +777,11 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     for word in delta.split(" "):
                         if not word:
                             continue
-                        content = f" {word}" if needs_space(last_char, word) else word
-                        last_char = content[-1]
+                        content = (
+                            f" {word}"
+                            if needs_space(state.emitted_text, word)
+                            else word
+                        )
                         chunk_resp = TranscriptionStreamResponse(
                             id=request_id,
                             created=created_time,
@@ -794,6 +794,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                             ],
                         )
                         yield f"data: {chunk_resp.model_dump_json()}\n\n"
+                        state.emitted_text += content
 
             # Send final stop
             chunk_resp = TranscriptionStreamResponse(
@@ -823,7 +824,6 @@ class OpenAIServingTranscription(OpenAIServingBase):
             websocket,
             tokenizer_manager=self.tokenizer_manager,
             adapter=self._adapter,
-            server_args=self.tokenizer_manager.server_args,
             session_semaphore=self._session_semaphore,
             encoder_window=self._encoder_window,
         )

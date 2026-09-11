@@ -101,7 +101,7 @@ class DecoderSuffixState(msgspec.Struct):
         holdback_units: int,
     ) -> SuffixUpdate:
         """Compute the publishable delta for one decode without mutating."""
-        if not split_units(continuation):
+        if not continuation.strip():
             if is_last:
                 return SuffixUpdate(delta=join_text("", self.pending), pending="")
             return SuffixUpdate(
@@ -127,27 +127,20 @@ class DecoderSuffixState(msgspec.Struct):
         pending = join_units(continuation_units[emit:])
         # Keep an accepted character prefix even when new audio extends its
         # final word; that word still needs agreement before publication.
+        candidate_text = join_units(continuation_units)
         confirmed_end = self.confirmed_pending_chars
         if pending_units == continuation_units:
-            confirmed_end = len(join_units(continuation_units))
-        pending_start = len(join_units(continuation_units)) - len(pending)
+            confirmed_end = len(candidate_text)
+        pending_start = len(candidate_text) - len(pending)
         return SuffixUpdate(
             delta=join_text("", join_units(continuation_units[:emit])),
             pending=pending,
             confirmed_pending_chars=max(0, confirmed_end - pending_start),
         )
 
-    def apply(self, update: SuffixUpdate) -> None:
-        if update.delta:
-            self.emitted_text = join_text(self.emitted_text, update.delta)
-        self.pending = update.pending
-        self.confirmed_pending_chars = update.confirmed_pending_chars
-
     def flush(self) -> str:
-        """Publish the pending tail when the item commits without new audio."""
+        """Release the pending tail for the caller to publish."""
         delta = join_text("", self.pending)
-        if delta:
-            self.emitted_text = join_text(self.emitted_text, delta)
         self.pending = ""
         self.confirmed_pending_chars = 0
         return delta

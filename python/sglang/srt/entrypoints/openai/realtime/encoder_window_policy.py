@@ -115,12 +115,22 @@ def resolve_realtime_encoder_window_policy(
             f"feature extractor sample rate {config.sample_rate} differs from the "
             f"model sample rate {adapter.model_sample_rate}"
         )
-    if max_buffer_seconds <= policy.min_audio_sec:
+    resolved = ResolvedEncoderWindowPolicy(
+        config=config, policy=policy, dp_size=max(1, int(dp_size))
+    )
+    chunk_seconds = adapter.chunked_streaming_config["chunk_size_sec"]
+    bytes_per_second = adapter.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
+    chunk_bytes = int(chunk_seconds * bytes_per_second)
+    # Non-final requests end on chunk boundaries and must strictly exceed
+    # the aligned threshold. A cap equal to the first eligible end is enough.
+    first_window_end = (
+        resolved.activation_threshold_bytes(chunk_bytes, chunk_seconds) + chunk_bytes
+    )
+    if max_buffer_seconds * bytes_per_second < first_window_end:
         logger.warning(
-            "[realtime] encoder windowing activates after %.0f s of audio but "
-            "--asr-max-buffer-seconds is %s; raise it above the threshold to "
-            "process longer items",
-            policy.min_audio_sec,
+            "[realtime] encoder windowing needs at least %g s of audio but "
+            "--asr-max-buffer-seconds is %s; raise it to allow windowing",
+            first_window_end / bytes_per_second,
             max_buffer_seconds,
         )
     logger.info(
@@ -136,6 +146,4 @@ def resolve_realtime_encoder_window_policy(
         policy.decoder_prefix_max_tokens,
         policy.decoder_prefix_holdback_units,
     )
-    return ResolvedEncoderWindowPolicy(
-        config=config, policy=policy, dp_size=max(1, int(dp_size))
-    )
+    return resolved

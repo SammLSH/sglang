@@ -23,7 +23,6 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_serving
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
@@ -102,7 +101,6 @@ async def handle_realtime_transcription(
     websocket: WebSocket,
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
-    server_args: ServerArgs,
     session_semaphore: asyncio.Semaphore,
     encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
 ) -> None:
@@ -143,7 +141,6 @@ async def handle_realtime_transcription(
                 transport,
                 tokenizer_manager,
                 adapter,
-                server_args,
                 encoder_window=encoder_window,
             )
             await session.send_session_created()
