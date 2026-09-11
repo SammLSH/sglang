@@ -16,7 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
     """How a realtime session may switch to encoder-window continuation.
 
-    The window geometry itself comes from the multimodal processor; this is
+    The window config itself comes from the multimodal processor; this is
     the adapter's declaration of when windowing is safe for its model.
     """
 

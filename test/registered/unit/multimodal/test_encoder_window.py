@@ -22,7 +22,7 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.multimodal.encoder_window import (
     build_audio_window_items,
     build_audio_window_processor_kwargs,
-    resolve_audio_window_geometry,
+    resolve_audio_window_config,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -97,7 +97,7 @@ def _items(owner, samples, *, leading_context_samples=0):
         samples=samples,
         input_ids=torch.tensor(PROMPT_IDS),
         placeholder_token_id=PLACEHOLDER,
-        geometry=owner.audio_window_geometry(),
+        config=owner.audio_window_config(),
         leading_context_samples=leading_context_samples,
     )
 
@@ -105,24 +105,24 @@ def _items(owner, samples, *, leading_context_samples=0):
 class TestAudioWindows(CustomTestCase):
     def setUp(self):
         self.owner = _owner()
-        self.geometry = self.owner.audio_window_geometry()
+        self.config = self.owner.audio_window_config()
         self.audio = (
             np.random.default_rng(7)
-            .normal(0, 0.1, 3 * self.geometry.window_samples + 4000)
+            .normal(0, 0.1, 3 * self.config.window_samples + 4000)
             .astype(np.float32)
         )
 
-    def test_geometry_checks_standalone_and_leading_context_padding(self):
+    def test_config_checks_standalone_and_leading_context_padding(self):
         owner = _owner()
         owner.audio_config = {"pad_to_multiple_of": 512}
         # Standalone extraction passes; only the leading-context probe catches
         # padding that changes a rolling window's width.
         standalone = owner.extract_audio_window_features(
-            [np.zeros(self.geometry.window_samples, dtype=np.float32)]
+            [np.zeros(self.config.window_samples, dtype=np.float32)]
         )
         self.assertEqual(standalone.features[0].shape[-1], 800)
         with self.assertRaisesRegex(ValueError, "unpadded frames"):
-            resolve_audio_window_geometry(owner)
+            resolve_audio_window_config(owner)
 
     def test_shared_encoder_default_keeps_short_input_padding(self):
         config = Qwen3OmniMoeAudioEncoderConfig(
@@ -146,7 +146,7 @@ class TestAudioWindows(CustomTestCase):
         self.assertEqual(output.last_hidden_state.shape, (4, 16))
 
     def test_windows_preserve_tails_offsets_and_cache_identity(self):
-        window = self.geometry.window_samples
+        window = self.config.window_samples
         items, ids = _items(self.owner, self.audio[: 2 * window + 4000])
         self.assertEqual(
             [item.offsets for item in items], [[(1, 104)], [(105, 208)], [(209, 212)]]
@@ -167,7 +167,7 @@ class TestAudioWindows(CustomTestCase):
         self.assertNotEqual(tiny_tail[1].hash, exact[1].hash)
         self.assertGreater(tiny_tail[1].feature.shape[-1], 800)
 
-        context = self.geometry.context_samples
+        context = self.config.context_samples
         self.assertEqual(context, 320)
         rolling, _ = _items(
             self.owner,
@@ -190,12 +190,12 @@ class TestAudioWindows(CustomTestCase):
         shorter = make(feature, torch.tensor([[1, 0]]), [(1, 1)])
         self.assertNotEqual(first.hash, shorter.hash)
 
-    def test_opt_in_uses_server_geometry_and_a_cold_worker_clone(self):
+    def test_opt_in_uses_server_config_and_a_cold_worker_clone(self):
         owner = _owner()
         source = owner._processor
         base = BaseMultiModalProcessorOutput(
             input_text="audio",
-            audios=[self.audio[: self.geometry.window_samples + 4000]],
+            audios=[self.audio[: self.config.window_samples + 4000]],
         )
         tokens = MultimodalSpecialTokens(audio_token_id=PLACEHOLDER)
         with patch.object(
@@ -230,7 +230,7 @@ class TestAudioWindows(CustomTestCase):
             ),
             ([], [], []),
         )
-        self.assertEqual(owner.audio_window_geometry(), self.geometry)
+        self.assertEqual(owner.audio_window_config(), self.config)
 
 
 if __name__ == "__main__":

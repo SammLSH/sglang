@@ -25,7 +25,7 @@ from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
     ResolvedEncoderWindowPolicy,
 )
 from sglang.srt.entrypoints.openai.realtime.handler import handle_realtime_transcription
-from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
+from sglang.srt.entrypoints.openai.realtime.session import RealtimeASRSession
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     RealtimeEncoderWindowPolicy,
 )
@@ -33,7 +33,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (
     Qwen3ASRAdapter,
 )
 from sglang.srt.multimodal.encoder_window import (
-    AudioWindowGeometry,
+    AudioEncoderWindowConfig,
     build_audio_window_processor_kwargs,
 )
 from sglang.srt.runtime_context import get_context, get_server_args
@@ -86,7 +86,7 @@ def _run(coro):
 def _policy(threshold):
     # At 1 Hz, an 8-s encoder window is eight samples / sixteen PCM16 bytes.
     return ResolvedEncoderWindowPolicy(
-        config=AudioWindowGeometry(
+        config=AudioEncoderWindowConfig(
             sample_rate=1,
             hop_length=1,
             window_frames=8,
@@ -122,8 +122,8 @@ def _connection(
             "unfixed_token_num": 1,
         },
     )
-    connection = RealtimeConnection(
-        Mock(send_text=AsyncMock(), close=AsyncMock()),
+    connection = RealtimeASRSession(
+        Mock(receive=AsyncMock(), send=AsyncMock(), finish=AsyncMock()),
         manager,
         adapter,
         get_server_args(),
@@ -133,7 +133,6 @@ def _connection(
     connection.config.input_sample_rate = adapter.model_sample_rate
     connection.config.language = "en"
     connection.config.sampling_params = {"max_new_tokens": 256}
-    connection._send = AsyncMock()
     return manager, connection
 
 
@@ -162,7 +161,7 @@ def _activate(connection, pending="four five six"):
 def _events(connection, suffix):
     return [
         call.args[0]
-        for call in connection._send.call_args_list
+        for call in connection.transport.send.call_args_list
         if call.args[0].type.endswith(suffix)
     ]
 
@@ -389,7 +388,7 @@ class TestRealtimeASR(CustomTestCase):
             self.assertIsNone(manager.requests[-1].mm_processor_kwargs)
             event.audio = base64.b64encode(bytes(2)).decode()
             self.assertTrue(_run(connection._on_input_audio_buffer_append(event)))
-            connection.websocket.close.assert_awaited_once_with(code=1009)
+            connection.transport.finish.assert_awaited_once_with("buffer_overflow")
             self.assertEqual(connection.asr_state.audio.received_bytes, 12)
 
     def test_window_request_requires_prefix_when_text_was_published(self):
@@ -451,24 +450,74 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(state.emitted_text, "one two three one two three four")
         self.assertEqual(" ".join(published), "one two three four")
 
-    def test_disconnect_waits_for_backend_cleanup_and_releases_session(self):
-        async def run():
+    def test_invalid_payload_clears_previous_client_event_id(self):
+        _, connection = _connection([])
+        cases = [
+            (
+                {"type": "unknown", "event_id": "first"},
+                ("unknown_event", "first", None),
+            ),
+            (ValueError("Invalid JSON"), ("invalid_payload", None, None)),
+            (
+                {"type": "input_audio_buffer.append", "event_id": "third"},
+                ("invalid_value", "third", "audio"),
+            ),
+            ({}, ("invalid_value", None, "type")),
+            ({"type": None}, ("invalid_value", None, "type")),
+        ]
+        for value in ([], {}, 17, True):
+            cases.extend(
+                [
+                    (
+                        {"type": value, "event_id": "bad-type"},
+                        ("invalid_value", "bad-type", "type"),
+                    ),
+                    (
+                        {"type": "input_audio_buffer.clear", "event_id": value},
+                        ("invalid_value", None, "event_id"),
+                    ),
+                ]
+            )
+        connection.transport.receive.side_effect = [raw for raw, _ in cases] + [
+            {"type": "input_audio_buffer.clear", "event_id": None},
+            {"type": "input_audio_buffer.clear", "event_id": ""},
+            {"type": "input_audio_buffer.clear"},
+            None,
+        ]
+        _run(connection.run())
+        errors = [event.error for event in _events(connection, "error")]
+        self.assertEqual(
+            [(error.code, error.event_id, error.param) for error in errors],
+            [expected for _, expected in cases],
+        )
+        self.assertEqual(len(_events(connection, ".cleared")), 3)
+        connection.transport.finish.assert_not_awaited()
+
+    def test_connection_exit_waits_for_backend_cleanup_and_releases_session(self):
+        async def run(exit_reason):
             manager, connection = _connection([], blocked=True)
             incoming = asyncio.Queue()
             incoming.put_nowait({"type": "websocket.connect"})
-            connection.websocket = WebSocket(
+            sent = AsyncMock()
+            websocket = WebSocket(
                 {"type": "websocket", "path": "/v1/realtime", "headers": []},
                 incoming.get,
-                AsyncMock(),
+                sent,
             )
+
+            def bind_transport(transport, *args, **kwargs):
+                transport._max_pending_bytes = 1024
+                connection.transport = transport
+                return connection
+
             semaphore = asyncio.Semaphore(1)
             with patch(
-                "sglang.srt.entrypoints.openai.realtime.handler.RealtimeConnection",
-                return_value=connection,
+                "sglang.srt.entrypoints.openai.realtime.handler.RealtimeASRSession",
+                side_effect=bind_transport,
             ):
                 task = asyncio.create_task(
                     handle_realtime_transcription(
-                        connection.websocket,
+                        websocket,
                         manager,
                         connection.adapter,
                         get_server_args(),
@@ -482,6 +531,7 @@ class TestRealtimeASR(CustomTestCase):
                             "text": json.dumps(
                                 {
                                     "type": "input_audio_buffer.append",
+                                    "event_id": "active-append",
                                     "audio": base64.b64encode(bytes(4)).decode(),
                                 }
                             ),
@@ -489,16 +539,44 @@ class TestRealtimeASR(CustomTestCase):
                     )
                     await asyncio.wait_for(manager.started.wait(), timeout=2)
                     self.assertTrue(semaphore.locked())
-                    incoming.put_nowait({"type": "websocket.disconnect", "code": 1000})
-                    await asyncio.wait_for(task, timeout=2)
+                    incoming.put_nowait({"type": "websocket.receive", "text": "{}"})
+                    await asyncio.sleep(0)
+                    self.assertFalse(connection.transport._incoming_messages.empty())
+                    if exit_reason == "cancel":
+                        task.cancel()
+                    else:
+                        incoming.put_nowait(
+                            {"type": "websocket.disconnect", "code": 1000}
+                            if exit_reason == "disconnect"
+                            else {"type": "websocket.receive", "text": "x" * 1024}
+                        )
+                    result = await asyncio.wait_for(
+                        asyncio.gather(task, return_exceptions=True), timeout=2
+                    )
+                    if exit_reason == "cancel":
+                        self.assertIsInstance(result[0], asyncio.CancelledError)
+                    else:
+                        self.assertEqual(result, [None])
                     self.assertTrue(manager.cleaned.is_set())
                     self.assertFalse(semaphore.locked())
+                    self.assertTrue(connection.transport._incoming_messages.empty())
+                    self.assertEqual(connection.transport._pending_input_bytes, 0)
+                    if exit_reason == "overflow":
+                        messages = [call.args[0] for call in sent.call_args_list]
+                        error = json.loads(messages[-2]["text"])["error"]
+                        self.assertEqual(
+                            (error["code"], error["event_id"]),
+                            ("buffer_overflow", None),
+                        )
+                        self.assertEqual(messages[-1]["code"], 1009)
                 finally:
                     if not task.done():
                         task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
-        _run(run())
+        for exit_reason in ("disconnect", "overflow", "cancel"):
+            with self.subTest(exit_reason=exit_reason):
+                _run(run(exit_reason))
 
 
 if __name__ == "__main__":

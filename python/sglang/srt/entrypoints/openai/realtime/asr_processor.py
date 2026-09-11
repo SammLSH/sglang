@@ -220,7 +220,7 @@ class RealtimeASRProcessor:
         self.routed_dp_rank: Optional[int] = None
         if encoder_window is not None:
             if encoder_window.window_bytes <= 0:
-                raise ValueError("invalid audio encoder-window geometry")
+                raise ValueError("invalid audio encoder-window config")
             self.activation_threshold_bytes = encoder_window.activation_threshold_bytes(
                 self.chunk_size_bytes, state.chunk_size_sec
             )

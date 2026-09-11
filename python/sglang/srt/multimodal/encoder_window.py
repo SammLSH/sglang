@@ -10,7 +10,7 @@ A model opts in by mixing ``WindowedAudioProcessorMixin`` into its multimodal
 processor and declaring an ``AudioEncoderWindowSpec``; entrypoints discover it
 with ``isinstance(processor, WindowedAudioProcessorMixin)``. Requests activate
 windowing through the payload built by ``build_audio_window_processor_kwargs``.
-The window geometry is always the server's own.
+The window config is always the server's own.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
 
 class AudioEncoderWindowSpec(msgspec.Struct, frozen=True):
-    """Window geometry a model declares, in feature frames.
+    """Window config a model declares, in feature frames.
 
     An aligned span of ``window_frames`` feature frames must be encodable
     independently of other windows. Feature extraction may use fixed
@@ -42,10 +42,10 @@ class AudioEncoderWindowSpec(msgspec.Struct, frozen=True):
     alignment_frames: int
 
 
-class AudioWindowGeometry(msgspec.Struct, frozen=True):
-    """Geometry resolved once from a spec and a feature extractor.
+class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
+    """Config resolved once from a spec and a feature extractor.
 
-    Requests use the server's processor geometry. Rolling callers must keep
+    Requests use the server's processor config. Rolling callers must keep
     window starts aligned and supply the same preceding audio context for
     unchanged complete windows to retain their hashes.
     """
@@ -83,20 +83,20 @@ class AudioWindowFeatures(NamedTuple):
     token_counts: list[int]
 
 
-def resolve_audio_window_geometry(
+def resolve_audio_window_config(
     window_processor: WindowedAudioProcessorMixin, *, processor: Any = None
-) -> AudioWindowGeometry:
+) -> AudioEncoderWindowConfig:
     """Validate a processor's window declaration against its feature extractor.
 
     Realtime startup resolves this eagerly when windowing is enabled; other
     callers may resolve it lazily. The mixin caches the result. Silent probes
-    with and without leading STFT context check feature geometry and predicted
+    with and without leading STFT context check feature shapes and predicted
     output lengths without running the encoder. An executor supplies its
     worker-local ``processor`` for lazy resolution.
     """
     spec = window_processor.audio_encoder_window_spec()
     if spec.window_frames <= 0 or spec.alignment_frames <= 0:
-        raise ValueError("encoder window geometry must be positive")
+        raise ValueError("encoder window frame counts must be positive")
     if spec.window_frames % spec.alignment_frames:
         raise ValueError(
             f"encoder window of {spec.window_frames} frames is not a multiple of "
@@ -155,7 +155,7 @@ def resolve_audio_window_geometry(
                 f"{window_tokens}"
             )
 
-    return AudioWindowGeometry(
+    return AudioEncoderWindowConfig(
         sample_rate=sample_rate,
         hop_length=hop_length,
         window_frames=spec.window_frames,
@@ -166,17 +166,17 @@ def resolve_audio_window_geometry(
     )
 
 
-def _validate_complete_window_geometry(
-    features: AudioWindowFeatures, geometry: AudioWindowGeometry
+def _validate_complete_window_config(
+    features: AudioWindowFeatures, config: AudioEncoderWindowConfig
 ) -> None:
     widths = [int(feature.shape[-1]) for feature in features.features]
-    if widths != [geometry.window_frames] * len(widths) or list(
+    if widths != [config.window_frames] * len(widths) or list(
         features.token_counts
-    ) != [geometry.window_tokens] * len(widths):
+    ) != [config.window_tokens] * len(widths):
         raise ValueError(
-            "encoder window geometry changed: complete windows produced "
+            "encoder window config mismatch: complete windows produced "
             f"{widths} frames and {list(features.token_counts)} tokens; expected "
-            f"{geometry.window_frames} frames and {geometry.window_tokens} tokens each"
+            f"{config.window_frames} frames and {config.window_tokens} tokens each"
         )
 
 
@@ -186,45 +186,45 @@ def build_audio_window_items(
     samples: np.ndarray,
     input_ids: torch.Tensor,
     placeholder_token_id: int,
-    geometry: AudioWindowGeometry,
+    config: AudioEncoderWindowConfig,
     leading_context_samples: int = 0,
     processor: Any = None,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Build complete-window items followed by an optional trailing item.
 
-    ``samples`` is mono audio at ``geometry.sample_rate``; its first
-    ``leading_context_samples`` (0 or ``geometry.context_samples``) are the
+    ``samples`` is mono audio at ``config.sample_rate``; its first
+    ``leading_context_samples`` (0 or ``config.context_samples``) are the
     audio that preceded the request's first window and are only used as
     extraction context. ``input_ids`` must contain exactly one unexpanded
     placeholder token; it is expanded to one token per encoder output position.
     Complete windows come first, in time order, and the tail (if any) is
     last, with contiguous, inclusive token offsets over the placeholder run.
     A sub-minimum tail is merged into the preceding window, so the trailing
-    item can be longer than ``geometry.window_samples``. Every window is
+    item can be longer than ``config.window_samples``. Every window is
     extracted from its own audio plus the preceding context, never from what
     follows it, so a complete window's features and hash do not depend on
     the audio that arrived after it.
     ``processor`` selects the worker-local frontend without changing the
-    window processor's cached geometry or its shared processor.
+    window processor's cached config or its shared processor.
     """
     samples = np.asarray(samples, dtype=np.float32)
     if samples.ndim != 1:
         raise ValueError("encoder windowing requires mono audio samples")
-    if leading_context_samples not in (0, geometry.context_samples):
+    if leading_context_samples not in (0, config.context_samples):
         raise ValueError(
-            f"leading context must be 0 or {geometry.context_samples} samples, "
+            f"leading context must be 0 or {config.context_samples} samples, "
             f"got {leading_context_samples}"
         )
     body_samples = samples.size - leading_context_samples
     if body_samples <= 0:
         raise ValueError("encoder windowing requires non-empty audio")
 
-    window_samples = geometry.window_samples
+    window_samples = config.window_samples
     complete_count, tail_samples = divmod(body_samples, window_samples)
-    if 0 < tail_samples < geometry.min_tail_samples:
+    if 0 < tail_samples < config.min_tail_samples:
         if complete_count == 0:
             raise ValueError(
-                f"audio shorter than {geometry.min_tail_samples} samples cannot be "
+                f"audio shorter than {config.min_tail_samples} samples cannot be "
                 "windowed"
             )
         # Merge a short remainder into the preceding window. The combined
@@ -244,22 +244,22 @@ def build_audio_window_items(
     window_inputs, window_context_frames = [], []
     start = first_window_start
     for end in window_ends:
-        context_samples = min(geometry.context_samples, start)
+        context_samples = min(config.context_samples, start)
         window_inputs.append(samples[start - context_samples : end])
-        window_context_frames.append(context_samples // geometry.hop_length)
+        window_context_frames.append(context_samples // config.hop_length)
         start = end
     extracted = window_processor.extract_audio_window_features(
         window_inputs,
         leading_context_frames=window_context_frames,
         processor=processor,
     )
-    _validate_complete_window_geometry(
+    _validate_complete_window_config(
         AudioWindowFeatures(
             extracted.features[:complete_count],
             extracted.masks[:complete_count],
             extracted.token_counts[:complete_count],
         ),
-        geometry,
+        config,
     )
     if has_tail and int(extracted.token_counts[-1]) <= 0:
         raise ValueError("audio tail produced no encoder tokens")
@@ -300,7 +300,7 @@ def build_audio_window_items(
 
 # Key inside GenerateReqInput.mm_processor_kwargs that opts a request into
 # windowing. Its value carries only the request's leading context; the
-# geometry is always the server's.
+# config is always the server's.
 ENCODER_WINDOW_KWARG = "encoder_window"
 LEADING_CONTEXT_KEY = "leading_context_samples"
 FEATURE_ATTENTION_MASK_KEY = "feature_attention_mask"
@@ -312,7 +312,7 @@ def build_audio_window_processor_kwargs(*, leading_context_samples: int = 0) -> 
 
 
 # Extract windows without truncation and with per-window padding and a valid-
-# frame mask. Geometry probes reject padding that changes complete-window sizes.
+# frame mask. Validation probes reject padding that changes complete-window sizes.
 _REQUIRED_EXTRACT_KWARGS = {
     "return_attention_mask": True,
     "return_tensors": "pt",
@@ -328,13 +328,13 @@ class WindowedAudioProcessorMixin:
     items whose hashes support encoder-output reuse.
 
     List it before ``BaseMultimodalProcessor`` in the class bases. The mixin
-    caches only its resolved geometry: it intercepts
+    caches only its resolved config: it intercepts
     ``process_and_combine_mm_data`` only when the request carries
     ``mm_processor_kwargs["encoder_window"]``, and every other request falls
     through to the base implementation unchanged.
     """
 
-    _cached_window_geometry: Optional[AudioWindowGeometry] = None
+    _cached_window_config: Optional[AudioEncoderWindowConfig] = None
 
     def audio_encoder_window_spec(self) -> AudioEncoderWindowSpec:
         """Declare the model's independently encodable window size and alignment."""
@@ -448,16 +448,16 @@ class WindowedAudioProcessorMixin:
 
     # Integration with BaseMultimodalProcessor.
 
-    def audio_window_geometry(self, *, processor: Any = None) -> AudioWindowGeometry:
-        """The server's window geometry, resolved once per processor.
+    def audio_window_config(self, *, processor: Any = None) -> AudioEncoderWindowConfig:
+        """The server's window config, resolved once per processor.
 
-        Requests opt into windowing but never choose the geometry.
+        Requests opt into windowing but never choose the config.
         """
-        if self._cached_window_geometry is None:
-            self._cached_window_geometry = resolve_audio_window_geometry(
+        if self._cached_window_config is None:
+            self._cached_window_config = resolve_audio_window_config(
                 self, processor=processor
             )
-        return self._cached_window_geometry
+        return self._cached_window_config
 
     def process_and_combine_mm_data(
         self,
@@ -479,7 +479,7 @@ class WindowedAudioProcessorMixin:
                 f"mm_processor_kwargs[{ENCODER_WINDOW_KWARG!r}] must be a mapping"
             )
         processor = kwargs.get("processor")
-        geometry = self.audio_window_geometry(processor=processor)
+        config = self.audio_window_config(processor=processor)
         leading_context_samples = int(window_request.get(LEADING_CONTEXT_KEY, 0))
         audios = base_output.audios or []
         if len(audios) != 1 or len(base_output.organize_results()) != 1:
@@ -498,7 +498,7 @@ class WindowedAudioProcessorMixin:
             samples=audios[0],
             input_ids=input_ids,
             placeholder_token_id=self.audio_placeholder_token_id(mm_tokens),
-            geometry=geometry,
+            config=config,
             leading_context_samples=leading_context_samples,
             processor=processor,
         )

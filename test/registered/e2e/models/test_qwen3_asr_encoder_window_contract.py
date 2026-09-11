@@ -25,7 +25,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.multimodal.encoder_window import (
     build_audio_window_items,
-    resolve_audio_window_geometry,
+    resolve_audio_window_config,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import load_audio
@@ -90,7 +90,7 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         cls.capability._processor = Qwen3ASRProcessor.from_pretrained(cls.snapshot)
         cls.capability.audio_config = {}
         cls.capability.hf_config = config
-        cls.window = resolve_audio_window_geometry(cls.capability)
+        cls.window = resolve_audio_window_config(cls.capability)
         response = requests.get(AUDIO_URL, timeout=120)
         response.raise_for_status()
         cls.audio = load_audio(response.content, sr=SAMPLE_RATE, mono=True).astype(
@@ -119,7 +119,7 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
             samples=samples,
             input_ids=torch.tensor([10, PLACEHOLDER, 11]),
             placeholder_token_id=PLACEHOLDER,
-            geometry=self.window,
+            config=self.window,
         )
         return items
 

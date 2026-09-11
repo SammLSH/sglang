@@ -19,7 +19,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.multimodal.encoder_window import (
-    AudioWindowGeometry,
+    AudioEncoderWindowConfig,
     WindowedAudioProcessorMixin,
 )
 
@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 
 
 class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
-    """Adapter policy paired with the model's resolved window geometry."""
+    """Adapter policy paired with the model's resolved window config."""
 
-    config: AudioWindowGeometry
+    config: AudioEncoderWindowConfig
     policy: RealtimeEncoderWindowPolicy
     # Data-parallel worker count the sessions are pinned across; 1 disables
     # pinning. Pinning keeps a session's window embeddings on one rank so the
@@ -50,8 +50,11 @@ class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
     def activation_threshold_bytes(
         self, chunk_size_bytes: int, chunk_size_sec: float
     ) -> int:
-        """Received bytes past which an item hands off to windowing, aligned to
-        an inference boundary so large appends and normal pacing switch alike."""
+        """Return the encoder window activation threshold in audio bytes.
+
+        Round up to a whole number of inference chunks. Activation requires
+        a non-final decode ending strictly after this threshold.
+        """
         return math.ceil(self.policy.min_audio_sec / chunk_size_sec) * chunk_size_bytes
 
     def pinned_dp_rank(self, session_id: str) -> Optional[int]:
@@ -72,11 +75,11 @@ def resolve_realtime_encoder_window_policy(
     decoder_prefix_max_tokens: Optional[int] = None,
     decoder_prefix_holdback_units: Optional[int] = None,
 ) -> Optional[ResolvedEncoderWindowPolicy]:
-    """Resolve the policy for ``--enable-asr-encoder-window``.
+    """Build an encoder window policy from adapter defaults and server overrides.
 
-    Returns None, with a warning, when the adapter or the processor does not
-    declare windowing; realtime then stays cumulative. Geometry problems raise
-    so a misconfigured server fails at startup.
+    If the adapter or processor lacks encoder window support, warn and return
+    None to keep realtime ASR in cumulative mode. A missing tokenizer or invalid
+    encoder window config raises an error during startup.
     """
     policy = adapter.realtime_encoder_window_policy
     if policy is None or not isinstance(mm_processor, WindowedAudioProcessorMixin):
@@ -106,7 +109,7 @@ def resolve_realtime_encoder_window_policy(
             "encoder-window ASR requires a tokenizer for the decoder prefix"
         )
 
-    config = mm_processor.audio_window_geometry()
+    config = mm_processor.audio_window_config()
     if config.sample_rate != adapter.model_sample_rate:
         raise ValueError(
             f"feature extractor sample rate {config.sample_rate} differs from the "

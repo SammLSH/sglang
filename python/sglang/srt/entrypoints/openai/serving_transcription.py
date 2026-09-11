@@ -80,7 +80,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._session_semaphore = asyncio.Semaphore(
             get_serving().asr_max_concurrent_sessions
         )
-        # Resolved once per server, not per connection: geometry validation
+        # Resolved once per server, not per connection: config validation
         # runs the feature extractor and must fail here, at startup.
         self._encoder_window = None
         serving_config = get_serving()
