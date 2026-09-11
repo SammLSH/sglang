@@ -21,10 +21,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-from sglang.srt.models.qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-    _get_feat_extract_output_lengths,
-)
+from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -75,9 +72,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def get_audio_feature(
-        self, items: List[MultimodalDataItem]
-    ) -> torch.Tensor | List[torch.Tensor]:
+    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         if not items:
             raise ValueError("audio encoding requires at least one item")
         device = next(self.audio_tower.parameters()).device
@@ -117,26 +112,9 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             # indexing and keeping (n_mels, total_valid_frames) for the encoder.
             valid = torch.cat(valid_frames).to(device=device, dtype=torch.bool)
             input_features = input_features[:, valid]
-        embedding = self.audio_tower(
+        return self.audio_tower(
             input_features, feature_lens=audio_feature_lengths
         ).last_hidden_state
-        if len(items) == 1:
-            return embedding
-
-        embedding = embedding.reshape(-1, embedding.shape[-1])
-        row_token_counts = _get_feat_extract_output_lengths(
-            audio_feature_lengths
-        ).tolist()
-        item_token_counts, row = [], 0
-        for item in items:
-            next_row = row + item.feature.shape[0]
-            item_token_counts.append(sum(row_token_counts[row:next_row]))
-            row = next_row
-        # Each cached item must own its storage; split views would keep the
-        # whole batch alive even after every other item has been evicted.
-        return [
-            part.clone() for part in torch.split(embedding, item_token_counts, dim=0)
-        ]
 
     def forward(
         self,

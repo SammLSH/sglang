@@ -109,25 +109,9 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         destroy_distributed_environment()
         torch.cuda.empty_cache()
 
-    def _embed(self, items, *, token_counts=None):
+    def _embed(self, items):
         with torch.no_grad():
             out = self.model.get_audio_feature(items)
-        if isinstance(out, list):
-            self.assertEqual(len(out), len(items))
-            self.assertEqual(
-                len({embedding.untyped_storage().data_ptr() for embedding in out}),
-                len(items),
-            )
-            if token_counts is not None:
-                self.assertEqual(
-                    [embedding.shape[0] for embedding in out], token_counts
-                )
-            for embedding in out:
-                self.assertEqual(
-                    embedding.untyped_storage().nbytes(),
-                    embedding.numel() * embedding.element_size(),
-                )
-            out = torch.cat(out)
         return out.reshape(-1, out.shape[-1]).float()
 
     def _items(self, samples):
@@ -180,11 +164,11 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
 
         # Variable-width items share one encoder call and match the per-item
         # results up to bf16 noise.
-        tail_tokens = per_window.shape[0] - tokens
-        batched = self._embed(items, token_counts=[tokens, tail_tokens])
+        batched = self._embed(items)
+        self.assertEqual(batched.shape, per_window.shape)
         self.assertLess(float((batched - per_window).abs().max()), 5e-2)
 
-        # Multiple feature rows still belong to one cache item.
+        # An input item can contain multiple feature rows.
         repeated = MultimodalDataItem(
             modality=Modality.AUDIO,
             feature=items[0].feature.repeat(2, 1, 1),
@@ -192,9 +176,7 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
                 "feature_attention_mask": items[0].feature_attention_mask.repeat(2, 1)
             },
         )
-        grouped = self._embed(
-            [repeated, items[1]], token_counts=[2 * tokens, tail_tokens]
-        )
+        grouped = self._embed([repeated, items[1]])
         expected = torch.cat([per_window[:tokens], per_window])
         self.assertEqual(grouped.shape, expected.shape)
         self.assertLess(float((grouped - expected).abs().max()), 5e-2)
