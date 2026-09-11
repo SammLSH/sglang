@@ -1,8 +1,9 @@
-"""Check Qwen3-ASR encoder equivalence required for window reuse.
+"""Check the checkpoint prompt and probe encoder windows on one natural clip.
 
-Compare whole-clip, per-window and batched encoding on the same real audio.
+These comparisons do not establish general encoder equivalence or WER.
 """
 
+import json
 import os
 import socket
 import unittest
@@ -12,7 +13,7 @@ import requests
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 import sglang.srt.configs  # noqa: F401  registers the Qwen3-ASR config classes
 from sglang.srt.configs.qwen3_asr import Qwen3ASRProcessor
@@ -108,10 +109,26 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         destroy_distributed_environment()
         torch.cuda.empty_cache()
 
-    def _embed(self, items):
+    def _embed(self, items, *, token_counts=None):
         with torch.no_grad():
-            out = self.model.get_audio_feature(items).float()
-        return out.reshape(-1, out.shape[-1])
+            out = self.model.get_audio_feature(items)
+        if isinstance(out, list):
+            self.assertEqual(len(out), len(items))
+            self.assertEqual(
+                len({embedding.untyped_storage().data_ptr() for embedding in out}),
+                len(items),
+            )
+            if token_counts is not None:
+                self.assertEqual(
+                    [embedding.shape[0] for embedding in out], token_counts
+                )
+            for embedding in out:
+                self.assertEqual(
+                    embedding.untyped_storage().nbytes(),
+                    embedding.numel() * embedding.element_size(),
+                )
+            out = torch.cat(out)
+        return out.reshape(-1, out.shape[-1]).float()
 
     def _items(self, samples):
         items, _ = build_audio_window_items(
@@ -123,7 +140,21 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         )
         return items
 
-    def test_windows_reproduce_the_whole_clip_encoding(self):
+    def test_default_prompt_matches_checkpoint_template(self):
+        from sglang.srt.multimodal.processors.qwen3_asr import DEFAULT_ASR_PROMPT
+
+        tokenizer = AutoTokenizer.from_pretrained(self.snapshot)
+        with open(os.path.join(self.snapshot, "chat_template.json")) as file:
+            template = json.load(file)["chat_template"]
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": [{"type": "audio", "audio": ""}]}],
+            chat_template=template,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        self.assertEqual(rendered, DEFAULT_ASR_PROMPT)
+
+    def test_natural_clip_window_encoding_probe(self):
         items = self._items(self.audio)
         self.assertEqual(len(items), 2)
         features = self.capability.extract_audio_window_features([self.audio])
@@ -142,29 +173,52 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
             segment = cosine[index * tokens : (index + 1) * tokens]
             with self.subTest(window=index):
                 self.assertGreaterEqual(float(segment.mean()), 0.98)
-                # The first token of a window is the one the extractor's
-                # boundary can still touch; leading context keeps it close.
+                # Check the first token as well as the segment average on
+                # this clip; feature differences can also affect later tokens.
                 self.assertGreaterEqual(float(segment[0]), 0.95)
         self.assertGreaterEqual(float((cosine >= 0.99).float().mean()), 0.95)
 
         # Variable-width items share one encoder call and match the per-item
         # results up to bf16 noise.
-        batched = self._embed(items)
+        tail_tokens = per_window.shape[0] - tokens
+        batched = self._embed(items, token_counts=[tokens, tail_tokens])
         self.assertLess(float((batched - per_window).abs().max()), 5e-2)
 
-    def test_short_tail_encoding_does_not_depend_on_other_cache_misses(self):
-        # A non-block-aligned tail must encode identically whether the preceding
-        # complete window is also a cache miss or is already cached.
-        samples = self.audio[: self.window.window_samples + 37 * self.window.hop_length]
-        items = self._items(samples)
-        cold = self._embed(items)[self.window.window_tokens :]
-        hot = self._embed([items[-1]])
-        self.assertEqual(cold.shape, hot.shape)
-        # Check both scale and direction, allowing bf16 batching differences.
-        relative_error = (cold - hot).norm() / cold.norm()
-        cosine = torch.nn.functional.cosine_similarity(cold, hot, dim=-1)
-        self.assertLess(float(relative_error), 0.05)
-        self.assertGreater(float(cosine.min()), 0.999)
+        # Multiple feature rows still belong to one cache item.
+        repeated = MultimodalDataItem(
+            modality=Modality.AUDIO,
+            feature=items[0].feature.repeat(2, 1, 1),
+            model_specific_data={
+                "feature_attention_mask": items[0].feature_attention_mask.repeat(2, 1)
+            },
+        )
+        grouped = self._embed(
+            [repeated, items[1]], token_counts=[2 * tokens, tail_tokens]
+        )
+        expected = torch.cat([per_window[:tokens], per_window])
+        self.assertEqual(grouped.shape, expected.shape)
+        self.assertLess(float((grouped - expected).abs().max()), 5e-2)
+
+    def test_tail_cache_miss_numerical_probe(self):
+        # Probe partial and complete convolution blocks with and without a
+        # preceding complete-window cache miss.
+        for frames in (25, 37, 99, 100, 200):
+            with self.subTest(tail_frames=frames):
+                samples = self.audio[
+                    : self.window.window_samples + frames * self.window.hop_length
+                ]
+                items = self._items(samples)
+                cold = self._embed(items)[self.window.window_tokens :]
+                hot = self._embed([items[-1]])
+                self.assertEqual(cold.shape, hot.shape)
+                # Check scale and direction, allowing bf16 batching differences.
+                relative_error = (cold - hot).norm() / cold.norm()
+                cosine = torch.nn.functional.cosine_similarity(cold, hot, dim=-1)
+                self.assertLess(float(relative_error), 0.05)
+                # Partial blocks exercise the padding fix. Full blocks retain
+                # the baseline batching tolerance checked above.
+                if frames < 100:
+                    self.assertGreater(float(cosine.min()), 0.999)
 
 
 if __name__ == "__main__":
