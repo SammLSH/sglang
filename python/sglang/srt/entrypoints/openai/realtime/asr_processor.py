@@ -342,7 +342,9 @@ class RealtimeASRProcessor:
         decoder_prefix = suffix_state.bounded_prefix(
             self.tokenizer_manager.tokenizer, max_prefix_tokens
         )
-        if suffix_state.emitted_text and not decoder_prefix:
+        if (
+            suffix_state.emitted_text or suffix_state.confirmed_pending_chars
+        ) and not decoder_prefix:
             raise RuntimeError(
                 "realtime ASR decoder prefix budget cannot retain a complete text unit"
             )
@@ -580,9 +582,8 @@ class RealtimeASRProcessor:
         )
         if (
             step.is_last
-            and state.audio.last_attempted_offset_bytes
-            > state.audio.last_processed_offset_bytes
-            and suffix_state.pending
+            and step.end_offset_bytes > state.audio.last_processed_offset_bytes
+            and len(suffix_state.pending) > suffix_state.confirmed_pending_chars
             and not text
         ):
             raise RuntimeError("final realtime ASR recovery returned empty text")
@@ -598,7 +599,9 @@ class RealtimeASRProcessor:
             audio_processed=(
                 step.is_last
                 or bool(update.delta)
-                or (update.empty_continuation and not suffix_state.pending)
+                # Confirmed holdback survives audio compaction in the decoder
+                # prefix. An unconfirmed suffix must still retain its audio.
+                or len(update.pending) == update.confirmed_pending_chars
             ),
             delta=update.delta,
             suffix_update=update,

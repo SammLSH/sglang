@@ -313,21 +313,101 @@ class TestRealtimeASR(CustomTestCase):
 
         self.assertEqual(manager.requests[1].text, "PROMPT:one two three")
 
-    def test_stalled_transcript_keeps_pcm_and_fails_at_the_retention_limit(self):
-        manager, connection = _connection([["yes."]] * 32, window=True)
-        _activate(connection, pending="yes.")
-        state = connection.asr_state
-        for _ in range(32):
-            state.audio.append_pcm(bytes(4))
-            self.assertEqual(_step(connection), "")
-        self.assertEqual(state.audio.last_processed_offset_bytes, 0)
-        self.assertEqual(len(manager.requests[-1].audio_data), 64)
-        self.assertTrue(state.has_new_audio)
-        state.audio.append_pcm(bytes(4))
-        with self.assertRaisesRegex(RuntimeError, "retained audio limit"):
-            _step(connection)
-        self.assertEqual(len(manager.requests), 32)
-        self.assertEqual(state.audio.base_offset_bytes, 0)
+    def test_stable_holdback_survives_long_silence_resume_commit_and_clear(self):
+        for ending in ("commit", "resume", "clear"):
+            with (
+                self.subTest(ending=ending),
+                get_context().override_server_args(asr_max_buffer_seconds=600),
+            ):
+                manager, connection = _connection([], window=True, threshold=60)
+                spoken = "yes."
+
+                async def generate(request, raw_request=None, **kwargs):
+                    manager.requests.append(request)
+                    prefix = request.text.removeprefix("PROMPT:")
+                    self.assertTrue(spoken.startswith(prefix), (spoken, prefix))
+                    yield {
+                        "text": spoken[len(prefix) :],
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+
+                manager.generate_request = generate
+
+                def append(seconds=2):
+                    # The fixture uses 1 Hz PCM; exercise normal append pacing.
+                    stop = _run(
+                        connection._on_input_audio_buffer_append(
+                            SimpleNamespace(
+                                audio=base64.b64encode(bytes(seconds * 2)).decode()
+                            )
+                        )
+                    )
+                    self.assertFalse(
+                        stop,
+                        (
+                            connection.asr_state.audio.received_bytes,
+                            _events(connection, "error"),
+                        ),
+                    )
+
+                for _ in range(250):
+                    append()
+                state = connection.asr_state
+                self.assertTrue(state.encoder_window_active)
+                self.assertGreaterEqual(state.audio.last_processed_offset_bytes, 996)
+                self.assertLessEqual(len(state.audio.data), 144)
+                self.assertEqual(state.decoder_suffix.confirmed_pending, "yes.")
+                self.assertFalse(_events(connection, ".delta"))
+                if ending == "resume":
+                    spoken = "yes. we continue."
+                    for _ in range(3):
+                        append()
+                elif ending == "clear":
+                    _run(connection._on_input_audio_buffer_clear(SimpleNamespace()))
+                    self.assertFalse(connection.asr_state.encoder_window_active)
+                    self.assertFalse(connection.asr_state.has_audio)
+                    spoken = "new item."
+                # A real sub-chunk tail must be decoded at commit, even in silence.
+                append(1)
+                requests_before_commit = len(manager.requests)
+                _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+                self.assertEqual(len(manager.requests), requests_before_commit + 1)
+                self.assertEqual(
+                    _events(connection, ".completed")[0].transcript, spoken
+                )
+                self.assertEqual(
+                    "".join(e.delta for e in _events(connection, ".delta")), spoken
+                )
+                self.assertFalse(connection.asr_state.has_audio)
+                self.assertFalse(connection.asr_state.encoder_window_active)
+
+    def test_unconfirmed_tail_retains_audio_despite_empty_or_changing_results(self):
+        for empty in (False, True):
+            with (
+                self.subTest(empty=empty),
+                get_context().override_server_args(asr_max_buffer_seconds=600),
+            ):
+                scripts = (
+                    [["yes."]] * 30
+                    + [["maybe."]]
+                    + [["" if empty else f"revision{i}."] for i in range(5)]
+                )
+                manager, connection = _connection(scripts, window=True, threshold=60)
+                event = SimpleNamespace(audio=base64.b64encode(bytes(4)).decode())
+                for _ in range(35):
+                    self.assertFalse(
+                        _run(connection._on_input_audio_buffer_append(event))
+                    )
+                state = connection.asr_state
+                self.assertEqual(state.audio.last_processed_offset_bytes, 120)
+                self.assertEqual(state.audio.base_offset_bytes, 0)
+                self.assertEqual(state.decoder_suffix.confirmed_pending_chars, 0)
+                with self.assertLogs(level="ERROR"):
+                    self.assertTrue(
+                        _run(connection._on_input_audio_buffer_append(event))
+                    )
+                self.assertEqual(len(manager.requests), 35)
+                self.assertFalse(_events(connection, ".completed"))
 
     def test_decoder_streaming_preserves_mixed_script_text(self):
         first = "价格是100元数量200件总额30000元税率10%预计3天交付"

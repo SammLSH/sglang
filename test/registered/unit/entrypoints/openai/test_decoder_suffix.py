@@ -27,6 +27,35 @@ class TestDecoderSuffixState(CustomTestCase):
         self.assertEqual(state.emitted_text, "one two three five one two")
         self.assertEqual(state.flush(), "")
 
+    def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(self):
+        tokenizer = SimpleNamespace(
+            encode=lambda text, **kwargs: list(text),
+            decode=lambda tokens, **kwargs: "".join(tokens),
+        )
+        for continuation, expected in (("pet", "carpet"), (" pet", "car pet")):
+            with self.subTest(continuation=continuation):
+                state = DecoderSuffixState("", pending="car")
+                state.apply(state.reconcile("car", is_last=False, holdback_units=1))
+                self.assertEqual(state.emitted_text, "")
+                self.assertEqual(state.confirmed_pending, "car")
+                self.assertEqual(state.bounded_prefix(tokenizer, 10), "car")
+                self.assertEqual(state.bounded_prefix(tokenizer, 2), "")
+                state.apply(
+                    state.reconcile(continuation, is_last=False, holdback_units=1)
+                )
+                self.assertEqual(state.confirmed_pending, "car")
+                self.assertEqual(state.pending, expected)
+                state.apply(
+                    state.reconcile(continuation, is_last=False, holdback_units=1)
+                )
+                state.flush()
+                self.assertEqual(state.emitted_text, expected)
+                self.assertEqual(state.confirmed_pending_chars, 0)
+        state = DecoderSuffixState("", pending="very very")
+        state.apply(state.reconcile("very very", is_last=False, holdback_units=1))
+        state.flush()
+        self.assertEqual(state.emitted_text, "very very")
+
     def test_punctuation_and_spaces_match_the_published_delta(self):
         state = DecoderSuffixState("Hello")
         update = state.reconcile(",  world", is_last=True, holdback_units=1)
@@ -37,6 +66,16 @@ class TestDecoderSuffixState(CustomTestCase):
         self.assertEqual(state.flush(), ", again")
         self.assertEqual(state.emitted_text, "Hello, world, again")
         self.assertEqual(state.flush(), "")
+
+    def test_revised_holdback_is_not_confirmed_by_normalized_agreement(self):
+        for revised in ("Yes.", "yes?", "yesterday"):
+            with self.subTest(revised=revised):
+                state = DecoderSuffixState("", pending="yes.")
+                state.apply(state.reconcile(revised, is_last=False, holdback_units=1))
+                self.assertEqual(state.confirmed_pending, "")
+                self.assertEqual(state.pending, revised)
+                state.apply(state.reconcile(revised, is_last=False, holdback_units=1))
+                self.assertEqual(state.confirmed_pending, revised)
 
     def test_prefix_keeps_whole_units_and_rechecks_the_token_budget(self):
         char_tokenizer = SimpleNamespace(
