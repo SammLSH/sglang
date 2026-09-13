@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import unittest
-from copy import copy
+from copy import copy, deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,12 +17,18 @@ maybe_stub_sgl_kernel()
 import numpy as np
 from fastapi import WebSocket
 
-from sglang.srt.entrypoints.openai.realtime.decoder_suffix import DecoderSuffixState
-from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
+    WindowedState,
+)
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
+    TranscriptionSuffixState,
+)
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     ResolvedEncoderWindowPolicy,
 )
 from sglang.srt.entrypoints.openai.realtime.handler import handle_realtime_transcription
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeASRSession
+from sglang.srt.entrypoints.openai.realtime.transport import WebSocketRealtimeTransport
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     RealtimeEncoderWindowPolicy,
 )
@@ -95,7 +101,6 @@ def _policy(threshold):
         policy=RealtimeEncoderWindowPolicy(
             min_audio_sec=threshold,
             max_audio_context_windows=6,
-            supported_languages=("en",),
             decoder_prefix_max_tokens=3,
             decoder_prefix_holdback_units=1,
         ),
@@ -132,7 +137,7 @@ def _connection(
     return manager, connection
 
 
-def _step(connection, *, language="en", is_last=False, published=None):
+def _step(connection, *, is_last=False, published=None):
     deltas = []
 
     async def collect(text):
@@ -141,9 +146,8 @@ def _step(connection, *, language="en", is_last=False, published=None):
             published.append(text)
 
     _run(
-        connection.asr_processor.process(
-            connection.asr_state,
-            language=language,
+        connection.transcription_processor.process(
+            connection.transcription_state,
             is_last=is_last,
             sampling_params=connection.config.sampling_params,
             on_transcript_delta=collect,
@@ -153,9 +157,9 @@ def _step(connection, *, language="en", is_last=False, published=None):
 
 
 def _activate(connection, pending="four five six"):
-    connection.asr_state.decoder_suffix = DecoderSuffixState(
-        emitted_text="one two three",
-        pending=pending,
+    connection.transcription_state.emitted_text = "one two three"
+    connection.transcription_state.mode_state = WindowedState(
+        suffix=TranscriptionSuffixState(pending=pending)
     )
 
 
@@ -179,19 +183,31 @@ class TestRealtimeASR(CustomTestCase):
             ),
         )
 
-    def test_windowing_requires_opt_in_language_and_nonfinal_update(self):
-        for enabled, language, final in (
-            (False, "en", False),
-            (True, None, False),
-            (True, "en", True),
+    def test_windowing_requires_opt_in_threshold_and_nonfinal_update(self):
+        for enabled, final, threshold, expected_window in (
+            (False, False, 0, False),
+            (True, True, 0, False),
+            (True, False, 2, False),
+            (True, False, 0, True),
         ):
-            with self.subTest(enabled=enabled, language=language, final=final):
-                manager, connection = _connection([["one two"]], window=enabled)
-                connection.asr_state.audio.append_pcm(bytes(4))
-                _step(connection, language=language, is_last=final)
-                self.assertFalse(connection.asr_state.encoder_window_active)
-                self.assertFalse(manager.requests[0].mm_processor_kwargs)
-                self.assertFalse(manager.requests[0].stream)
+            for language in (None, "en", "zh"):
+                with self.subTest(
+                    enabled=enabled, language=language, final=final, threshold=threshold
+                ):
+                    manager, connection = _connection(
+                        [["one two"]], window=enabled, threshold=threshold
+                    )
+                    connection.config.language = language
+                    connection.transcription_state.audio.append_pcm(bytes(4))
+                    self.assertTrue(_run(connection._run_inference(is_last=final)))
+                    self.assertEqual(
+                        connection.transcription_state.encoder_window_active,
+                        expected_window,
+                    )
+                    self.assertEqual(
+                        bool(manager.requests[0].mm_processor_kwargs), expected_window
+                    )
+                    self.assertFalse(manager.requests[0].stream)
 
     def test_cumulative_truncation_keeps_text_prefix_and_audio_unchanged(self):
         for final in (False, True):
@@ -199,17 +215,17 @@ class TestRealtimeASR(CustomTestCase):
                 manager, connection = _connection(
                     [["one two three"], [("repeated " * 10, {"type": "length"})]]
                 )
-                state = connection.asr_state
-                state.transcript.unfixed_chunk_num = 1
+                state = connection.transcription_state
+                state.mode_state.transcript.unfixed_chunk_num = 1
                 state.audio.append_pcm(bytes(4))
                 _step(connection)
-                before = vars(state.transcript).copy()
+                before = vars(state.mode_state.transcript).copy()
                 state.audio.append_pcm(bytes(2))
                 published = []
                 with self.assertRaisesRegex(RuntimeError, "max_new_tokens"):
                     _step(connection, is_last=final, published=published)
                 self.assertEqual(published, [])
-                self.assertEqual(vars(state.transcript), before)
+                self.assertEqual(vars(state.mode_state.transcript), before)
                 self.assertEqual(manager.requests[-1].text, "PROMPT:one two")
                 self.assertFalse(manager.requests[-1].stream)
                 self.assertEqual(state.audio.last_attempted_offset_bytes, 4)
@@ -220,14 +236,17 @@ class TestRealtimeASR(CustomTestCase):
         manager, connection = _connection(
             [["Hello there"], ["Hello,  world today"], [", today!"]]
         )
-        transcript = copy(connection.asr_state.transcript)
-        transcript.emitted_text = "Hello"
+        transcript = copy(connection.transcription_state.mode_state.transcript)
         transcript.full_transcript = "Hello,  world"
-        self.assertEqual(transcript.unpublished_text(split_cjk=True), ", world")
+        self.assertEqual(
+            transcript.unpublished_text(emitted_text="Hello", split_cjk=True), ", world"
+        )
         # A rejected mid-word extension retains the old fallback origin.
-        transcript.emitted_text = "one two"
         transcript.full_transcript = "one twofold three"
-        self.assertEqual(transcript.unpublished_text(split_cjk=True), "twofold three")
+        self.assertEqual(
+            transcript.unpublished_text(emitted_text="one two", split_cjk=True),
+            "twofold three",
+        )
         # Two complete chunks, then one real sample handled by commit.
         for size in (4, 4, 2):
             _run(
@@ -251,15 +270,15 @@ class TestRealtimeASR(CustomTestCase):
                 manager, connection = _connection([[""], [final_frame]], window=window)
                 if window:
                     _activate(connection)
-                connection.asr_state.audio.append_pcm(bytes(4))
+                connection.transcription_state.audio.append_pcm(bytes(4))
                 _step(connection)
-                connection.asr_state.audio.append_pcm(bytes(2))
+                connection.transcription_state.audio.append_pcm(bytes(2))
                 with self.assertLogs(level="ERROR"):
                     _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
                 self.assertEqual(len(manager.requests[-1].audio_data), 3)
                 self.assertEqual(len(_events(connection, ".failed")), 1)
                 self.assertFalse(_events(connection, ".completed"))
-                self.assertFalse(connection.asr_state.has_audio)
+                self.assertFalse(connection.transcription_state.has_audio)
 
     def test_handoff_then_rolling_requests_preserve_context_and_compact_pcm(self):
         manager, connection = _connection(
@@ -275,7 +294,7 @@ class TestRealtimeASR(CustomTestCase):
             window=True,
             threshold=60,
         )
-        state = connection.asr_state
+        state = connection.transcription_state
         state.audio.append_pcm(np.arange(58, dtype=np.int16).tobytes())
         state.audio.last_attempted_offset_bytes = 116
         state.audio.last_processed_offset_bytes = 116
@@ -346,18 +365,18 @@ class TestRealtimeASR(CustomTestCase):
                     self.assertFalse(
                         stop,
                         (
-                            connection.asr_state.audio.received_bytes,
+                            connection.transcription_state.audio.received_bytes,
                             _events(connection, "error"),
                         ),
                     )
 
                 for _ in range(250):
                     append()
-                state = connection.asr_state
+                state = connection.transcription_state
                 self.assertTrue(state.encoder_window_active)
                 self.assertGreaterEqual(state.audio.last_processed_offset_bytes, 996)
                 self.assertLessEqual(len(state.audio.data), 144)
-                self.assertEqual(state.decoder_suffix.confirmed_pending, "yes.")
+                self.assertEqual(state.mode_state.suffix.confirmed_pending, "yes.")
                 self.assertFalse(_events(connection, ".delta"))
                 if ending == "resume":
                     spoken = "yes. we continue."
@@ -365,8 +384,10 @@ class TestRealtimeASR(CustomTestCase):
                         append()
                 elif ending == "clear":
                     _run(connection._on_input_audio_buffer_clear(SimpleNamespace()))
-                    self.assertFalse(connection.asr_state.encoder_window_active)
-                    self.assertFalse(connection.asr_state.has_audio)
+                    self.assertFalse(
+                        connection.transcription_state.encoder_window_active
+                    )
+                    self.assertFalse(connection.transcription_state.has_audio)
                     spoken = "new item."
                 # A real sub-chunk tail must be decoded at commit, even in silence.
                 append(1)
@@ -379,8 +400,8 @@ class TestRealtimeASR(CustomTestCase):
                 self.assertEqual(
                     "".join(e.delta for e in _events(connection, ".delta")), spoken
                 )
-                self.assertFalse(connection.asr_state.has_audio)
-                self.assertFalse(connection.asr_state.encoder_window_active)
+                self.assertFalse(connection.transcription_state.has_audio)
+                self.assertFalse(connection.transcription_state.encoder_window_active)
 
     def test_unconfirmed_tail_retains_audio_despite_empty_or_changing_results(self):
         for empty in (False, True):
@@ -399,10 +420,10 @@ class TestRealtimeASR(CustomTestCase):
                     self.assertFalse(
                         _run(connection._on_input_audio_buffer_append(event))
                     )
-                state = connection.asr_state
+                state = connection.transcription_state
                 self.assertEqual(state.audio.last_processed_offset_bytes, 120)
                 self.assertEqual(state.audio.base_offset_bytes, 0)
-                self.assertEqual(state.decoder_suffix.confirmed_pending_chars, 0)
+                self.assertEqual(state.mode_state.suffix.confirmed_pending_chars, 0)
                 with self.assertLogs(level="ERROR"):
                     self.assertTrue(
                         _run(connection._on_input_audio_buffer_append(event))
@@ -468,7 +489,7 @@ class TestRealtimeASR(CustomTestCase):
                         _run(connection._on_input_audio_buffer_append(event))
                     )
                     self.assertEqual(
-                        connection.asr_state.emitted_text,
+                        connection.transcription_state.emitted_text,
                         "".join(e.delta for e in _events(connection, ".delta")),
                     )
                 self.assertEqual(manager.requests[-1].text, "PROMPT:" + expected_prefix)
@@ -504,12 +525,18 @@ class TestRealtimeASR(CustomTestCase):
                         _run(connection._on_input_audio_buffer_append(event))
                     )
                 self.assertEqual(
-                    connection.asr_state.emitted_text, "one" if streaming else ""
+                    connection.transcription_state.emitted_text,
+                    "one" if streaming else "",
                 )
-                self.assertEqual(connection.asr_state.emitted_text, "".join(delivered))
-                self.assertEqual(connection.asr_state.transcript.full_transcript, "")
                 self.assertEqual(
-                    connection.asr_state.audio.last_processed_offset_bytes, 0
+                    connection.transcription_state.emitted_text, "".join(delivered)
+                )
+                self.assertEqual(
+                    connection.transcription_state.mode_state.transcript.full_transcript,
+                    "",
+                )
+                self.assertEqual(
+                    connection.transcription_state.audio.last_processed_offset_bytes, 0
                 )
                 connection.transport.finish.assert_awaited_once_with("server_error")
 
@@ -524,8 +551,8 @@ class TestRealtimeASR(CustomTestCase):
                 _, connection = _connection([frames], window=window, streaming=True)
                 if window:
                     _activate(connection)
-                state = connection.asr_state
-                transcript_before = vars(state.transcript).copy()
+                state = connection.transcription_state
+                mode_before = deepcopy(state.mode_state)
                 emitted_before = state.emitted_text
                 state.audio.append_pcm(bytes(4))
                 published = []
@@ -535,15 +562,13 @@ class TestRealtimeASR(CustomTestCase):
                 self.assertEqual(
                     state.emitted_text, emitted_before + "".join(published)
                 )
-                transcript_after = vars(state.transcript).copy()
-                transcript_after["emitted_text"] = transcript_before["emitted_text"]
-                self.assertEqual(transcript_after, transcript_before)
+                self.assertEqual(state.mode_state, mode_before)
                 self.assertEqual(state.audio.last_attempted_offset_bytes, 0)
                 self.assertEqual(state.audio.last_processed_offset_bytes, 0)
                 self.assertEqual(state.audio.base_offset_bytes, 0)
                 self.assertEqual(bytes(state.audio.data), bytes(4))
                 if window:
-                    self.assertEqual(state.decoder_suffix.pending, "four five six")
+                    self.assertEqual(state.mode_state.suffix.pending, "four five six")
 
     def test_item_audio_limit_still_applies_after_window_fallback(self):
         with get_context().override_server_args(asr_max_buffer_seconds=6):
@@ -556,7 +581,7 @@ class TestRealtimeASR(CustomTestCase):
             event.audio = base64.b64encode(bytes(2)).decode()
             self.assertTrue(_run(connection._on_input_audio_buffer_append(event)))
             connection.transport.finish.assert_awaited_once_with("buffer_overflow")
-            self.assertEqual(connection.asr_state.audio.received_bytes, 12)
+            self.assertEqual(connection.transcription_state.audio.received_bytes, 12)
 
     def test_window_request_requires_prefix_when_text_was_published(self):
         for active in (False, True):
@@ -567,11 +592,10 @@ class TestRealtimeASR(CustomTestCase):
                     encode=lambda text, **kwargs: [1, 2, 3, 4],
                     decode=lambda tokens, **kwargs: "ization",
                 )
-                state = connection.asr_state
+                state = connection.transcription_state
+                state.emitted_text = "internationalization"
                 if active:
-                    state.decoder_suffix = DecoderSuffixState("internationalization")
-                else:
-                    state.transcript.emitted_text = "internationalization"
+                    state.mode_state = WindowedState(suffix=TranscriptionSuffixState())
                 state.audio.append_pcm(bytes(4))
                 with self.assertRaisesRegex(RuntimeError, "prefix budget"):
                     _step(connection)
@@ -590,7 +614,7 @@ class TestRealtimeASR(CustomTestCase):
             streaming=True,
         )
         _activate(connection, pending="one two three four five")
-        state = connection.asr_state
+        state = connection.transcription_state
         original_pcm = np.array([1, 2], dtype=np.int16).tobytes()
         state.audio.append_pcm(original_pcm)
         published = []
@@ -602,7 +626,7 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(state.audio.last_processed_offset_bytes, 0)
         self.assertEqual(bytes(state.audio.data), original_pcm)
         self.assertEqual(state.emitted_text, "one two three")
-        self.assertEqual(state.decoder_suffix.pending, "one two three four five")
+        self.assertEqual(state.mode_state.suffix.pending, "one two three four five")
 
         state.audio.append_pcm(np.array([3, 4], dtype=np.int16).tobytes())
         _step(connection, published=published)
@@ -611,7 +635,7 @@ class TestRealtimeASR(CustomTestCase):
             np.array([1, 2, 3, 4], dtype=np.float32) / 32768.0,
         )
         self.assertEqual(state.audio.last_processed_offset_bytes, 8)
-        self.assertEqual(state.consecutive_window_failures, 0)
+        self.assertEqual(state.mode_state.consecutive_failures, 0)
         self.assertFalse(state.has_new_audio)
         self.assertEqual(manager.requests[-1].text, "PROMPT:one two three")
         self.assertEqual(state.emitted_text, "one two three one two three four")
@@ -685,7 +709,7 @@ class TestRealtimeASR(CustomTestCase):
             ):
                 task = asyncio.create_task(
                     handle_realtime_transcription(
-                        websocket,
+                        WebSocketRealtimeTransport(websocket),
                         manager,
                         connection.adapter,
                         semaphore,

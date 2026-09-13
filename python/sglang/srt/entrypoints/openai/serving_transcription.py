@@ -27,6 +27,7 @@ import logging
 import math
 import time
 import uuid
+from copy import copy
 from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
 
 from fastapi import Request, WebSocket
@@ -46,14 +47,15 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.realtime import (
     handle_realtime_transcription,
 )
-from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     resolve_realtime_encoder_window_policy,
 )
+from sglang.srt.entrypoints.openai.realtime.transport import WebSocketRealtimeTransport
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.entrypoints.openai.streaming_asr import (
-    StreamingASRState,
+from sglang.srt.entrypoints.openai.streaming_transcription import (
+    CumulativeTranscriptState,
     needs_space,
-    process_asr_chunk,
+    process_transcription_chunk,
     split_audio_chunks,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
@@ -87,14 +89,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
         if serving_config.enable_asr_encoder_window:
             self._encoder_window = resolve_realtime_encoder_window_policy(
                 adapter=self._adapter,
-                mm_processor=tokenizer_manager.mm_processor,
-                tokenizer=tokenizer_manager.tokenizer,
-                max_buffer_seconds=serving_config.asr_max_buffer_seconds,
-                dp_size=tokenizer_manager.elastic_worker_count,
-                min_audio_sec=serving_config.asr_encoder_window_min_audio_seconds,
-                max_audio_context_windows=serving_config.asr_encoder_window_max_context_windows,
-                decoder_prefix_max_tokens=serving_config.asr_decoder_prefix_max_tokens,
-                decoder_prefix_holdback_units=serving_config.asr_decoder_prefix_holdback_units,
+                tokenizer_manager=tokenizer_manager,
+                serving_config=serving_config,
             )
 
     def _request_id_prefix(self) -> str:
@@ -471,7 +467,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             # No background abort_task: each chunk is a separate request;
             # client disconnection is detected via is_disconnected() in the loop.
             return StreamingResponse(
-                self._generate_chunked_asr_stream(
+                self._generate_chunked_transcription_stream(
                     adapted_request, request, raw_request
                 ),
                 media_type="text/event-stream",
@@ -614,7 +610,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         """Stream transcription of long audio pre-split into chunks.
 
         Chunks are transcribed sequentially (one streaming request at a
-        time, like ``_generate_chunked_asr_stream``), so the client sees
+        time, like ``_generate_chunked_transcription_stream``), so the client sees
         the transcript in audio order with a single finish frame after the
         last chunk. The first abnormal chunk finish_reason (length/abort)
         wins so a truncated non-final chunk isn't masked by later chunks
@@ -731,7 +727,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         yield "data: [DONE]\n\n"
 
-    async def _generate_chunked_asr_stream(
+    async def _generate_chunked_transcription_stream(
         self,
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
@@ -751,7 +747,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
-        state = StreamingASRState(**self._adapter.chunked_streaming_config)
+        state = CumulativeTranscriptState(**self._adapter.chunked_streaming_config)
+        # Publication is separate from the candidate updated for each chunk.
+        emitted_text = ""
 
         try:
             chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
@@ -762,10 +760,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     break
                 is_last = i == len(chunks) - 1
 
-                delta = await process_asr_chunk(
+                candidate = copy(state)
+                delta = await process_transcription_chunk(
                     tokenizer_manager=self.tokenizer_manager,
                     adapter=self._adapter,
-                    state=state,
+                    state=candidate,
+                    emitted_text=emitted_text,
                     audio_data=chunk_audio,
                     sampling_params=adapted_request.sampling_params,
                     is_last=is_last,
@@ -778,9 +778,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                         if not word:
                             continue
                         content = (
-                            f" {word}"
-                            if needs_space(state.emitted_text, word)
-                            else word
+                            f" {word}" if needs_space(emitted_text, word) else word
                         )
                         chunk_resp = TranscriptionStreamResponse(
                             id=request_id,
@@ -794,7 +792,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
                             ],
                         )
                         yield f"data: {chunk_resp.model_dump_json()}\n\n"
-                        state.emitted_text += content
+                        emitted_text += content
+
+                state = candidate
 
             # Send final stop
             chunk_resp = TranscriptionStreamResponse(
@@ -821,7 +821,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await handle_realtime_transcription(
-            websocket,
+            WebSocketRealtimeTransport(websocket),
             tokenizer_manager=self.tokenizer_manager,
             adapter=self._adapter,
             session_semaphore=self._session_semaphore,

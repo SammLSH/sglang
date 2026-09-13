@@ -50,9 +50,6 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
             # Default recent-text budget, overridable at server startup.
             decoder_prefix_max_tokens=192,
             decoder_prefix_holdback_units=1,
-            # Suffix continuation is validated for explicit English sessions.
-            # Unknown and auto-detected languages keep cumulative semantics.
-            supported_languages=("en",),
         )
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import msgspec
 
-from sglang.srt.entrypoints.openai.streaming_asr import (
+from sglang.srt.entrypoints.openai.streaming_transcription import (
     common_unit_prefix,
     is_cjk_char,
     join_text,
@@ -56,11 +56,12 @@ def _align_to_unit_boundary(source: str, tail: str) -> str:
     return tail[len(units[0]) :].lstrip()
 
 
-class DecoderSuffixState(msgspec.Struct):
-    """Authoritative transcript state while encoder windowing is active."""
+class TranscriptionSuffixState(msgspec.Struct):
+    """Unpublished continuation text and its confirmed prefix.
 
-    # Everything published to the client so far.
-    emitted_text: str
+    Published text is supplied by the caller when building decoder context.
+    """
+
     # Unpublished text; its confirmed prefix is also supplied to the decoder.
     pending: str = ""
     confirmed_pending_chars: int = 0
@@ -69,10 +70,10 @@ class DecoderSuffixState(msgspec.Struct):
     def confirmed_pending(self) -> str:
         return self.pending[: self.confirmed_pending_chars]
 
-    def bounded_prefix(self, tokenizer, max_tokens: int) -> str:
+    def bounded_prefix(self, tokenizer, max_tokens: int, *, emitted_text: str) -> str:
         """The most recent confirmed text, at most ``max_tokens`` tokens long,
         starting on a unit boundary."""
-        source = join_text(self.emitted_text, self.confirmed_pending)
+        source = join_text(emitted_text, self.confirmed_pending)
         if not source or max_tokens <= 0:
             return ""
         tail = source[-max_tokens * _MAX_CHARS_PER_TOKEN :]

@@ -1,6 +1,6 @@
-"""WebSocket entry for realtime transcription.
+"""Connection lifecycle for realtime transcription.
 
-Assembles the transport and session, and owns connection task cleanup.
+Validates admission, creates the session, and owns connection task cleanup.
 """
 
 from __future__ import annotations
@@ -9,15 +9,14 @@ import asyncio
 import logging
 from typing import Optional
 
-from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import RealtimeErrorEvent
 from openai.types.realtime.realtime_error import RealtimeError
 
-from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     ResolvedEncoderWindowPolicy,
 )
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeASRSession
-from sglang.srt.entrypoints.openai.realtime.transport import WebSocketRealtimeTransport
+from sglang.srt.entrypoints.openai.realtime.transport import RealtimeTransport
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
@@ -27,28 +26,16 @@ from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
 
-# Preserve the original default queue budget: 60 s * 48,000 samples/s *
-# 2 bytes/sample (PCM16) * 2 for base64/JSON overhead = 11,520,000 bytes.
-# Keep this fixed so raising the item duration limit does not grow the backlog.
-_MAX_PENDING_INPUT_BYTES = 11_520_000
 
-
-async def _safe_send(websocket: WebSocket, text: str) -> None:
+async def _safe_send(transport: RealtimeTransport, event: RealtimeErrorEvent) -> None:
     try:
-        await websocket.send_text(text)
-    except (WebSocketDisconnect, RuntimeError) as e:
+        await transport.send(event)
+    except ConnectionError as e:
         logger.debug("[realtime] send failed (peer gone): %s", e)
 
 
-async def _safe_close(websocket: WebSocket) -> None:
-    try:
-        await websocket.close()
-    except (WebSocketDisconnect, RuntimeError) as e:
-        logger.debug("[realtime] close failed (already closed): %s", e)
-
-
 async def _reject_before_session(
-    websocket: WebSocket,
+    transport: RealtimeTransport,
     code: str,
     message: str,
     *,
@@ -57,24 +44,26 @@ async def _reject_before_session(
     """Reject path that runs before acquiring the session semaphore, so
     unsupported / over-capacity peers don't hold a session slot."""
     try:
-        await websocket.accept()
-    except (WebSocketDisconnect, RuntimeError) as e:
-        logger.debug("[realtime] reject: accept failed: %s", e)
+        await transport.open()
+    except ConnectionError as e:
+        logger.debug("[realtime] reject: open failed: %s", e)
         return
-    logger.info("[realtime] rejected (%s)", code)
-    envelope = RealtimeErrorEvent(
-        event_id=f"event_{random_uuid()}",
-        type="error",
-        error=RealtimeError(type=error_type, code=code, message=message),
-    )
-    await _safe_send(websocket, envelope.model_dump_json())
-    await _safe_close(websocket)
+    try:
+        logger.info("[realtime] rejected (%s)", code)
+        envelope = RealtimeErrorEvent(
+            event_id=f"event_{random_uuid()}",
+            type="error",
+            error=RealtimeError(type=error_type, code=code, message=message),
+        )
+        await _safe_send(transport, envelope)
+    finally:
+        await transport.finish()
 
 
 async def _run_connection_tasks(
-    transport: WebSocketRealtimeTransport, session: RealtimeASRSession
+    transport: RealtimeTransport, session: RealtimeASRSession
 ) -> None:
-    """Stop and await both tasks when the WebSocket or the session exits."""
+    """Drain normal input completion; cancel on disconnection or session exit."""
     receiver_task = asyncio.create_task(transport.receive_messages())
     consumer_task = asyncio.create_task(session.run())
     overflow = False
@@ -84,6 +73,8 @@ async def _run_connection_tasks(
         )
         if receiver_task in done:
             overflow = receiver_task.result()
+            if not overflow:
+                await consumer_task
         else:
             consumer_task.result()
     finally:
@@ -98,19 +89,21 @@ async def _run_connection_tasks(
 
 
 async def handle_realtime_transcription(
-    websocket: WebSocket,
+    transport: RealtimeTransport,
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
     session_semaphore: asyncio.Semaphore,
     encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
 ) -> None:
-    """WS endpoint for /v1/realtime. Pre-session validation runs before
-    the semaphore so rejects don't consume a session slot; the
-    ``async with`` then guarantees the slot is released even if
-    RealtimeASRSession raises."""
+    """Run one realtime session over the supplied transport.
+
+    Pre-session validation runs before the semaphore so rejects don't consume a
+    session slot. The ``async with`` releases the slot even if session creation
+    or processing raises.
+    """
     if not adapter.supports_chunked_streaming:
         await _reject_before_session(
-            websocket,
+            transport,
             "not_supported",
             "Model does not support streaming ASR",
         )
@@ -118,7 +111,7 @@ async def handle_realtime_transcription(
 
     if session_semaphore.locked():
         await _reject_before_session(
-            websocket,
+            transport,
             "too_many_sessions",
             f"Maximum concurrent sessions reached "
             f"({get_serving().asr_max_concurrent_sessions}).",
@@ -129,14 +122,7 @@ async def handle_realtime_transcription(
     async with session_semaphore:
         session = None
         try:
-            try:
-                await websocket.accept()
-            except (WebSocketDisconnect, RuntimeError) as e:
-                logger.debug("[realtime] accept failed: %s", e)
-                return
-            transport = WebSocketRealtimeTransport(
-                websocket, max_pending_bytes=_MAX_PENDING_INPUT_BYTES
-            )
+            await transport.open()
             session = RealtimeASRSession(
                 transport,
                 tokenizer_manager,
@@ -145,7 +131,7 @@ async def handle_realtime_transcription(
             )
             await session.send_session_created()
             await _run_connection_tasks(transport, session)
-        except (WebSocketDisconnect, ConnectionError):
+        except ConnectionError:
             logger.info("[realtime] client disconnected (normal)")
         except Exception:
             logger.exception("[realtime] unexpected error in session")
@@ -168,6 +154,6 @@ async def handle_realtime_transcription(
                     message="Internal server error",
                 ),
             )
-            await _safe_send(websocket, envelope.model_dump_json())
+            await _safe_send(transport, envelope)
         finally:
-            await _safe_close(websocket)
+            await transport.finish()

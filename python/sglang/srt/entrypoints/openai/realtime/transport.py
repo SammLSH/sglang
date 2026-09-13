@@ -12,6 +12,11 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# Preserve the original default queue budget: 60 s * 48,000 samples/s *
+# 2 bytes/sample (PCM16) * 2 for base64/JSON overhead = 11,520,000 bytes.
+# Keep this fixed so raising the item duration limit does not grow the backlog.
+_MAX_PENDING_INPUT_BYTES = 11_520_000
+
 # Conservative per-frame bookkeeping budget; even empty frames consume queue
 # capacity. This is an accounting allowance, not a measured Python object size.
 _QUEUED_FRAME_OVERHEAD_BYTES = 256
@@ -20,7 +25,20 @@ FinishReason = Literal["normal", "buffer_overflow", "server_error"]
 
 
 class RealtimeTransport(Protocol):
-    """One realtime event stream, independent of the underlying connection."""
+    """One realtime event stream and its connection lifecycle."""
+
+    async def open(self) -> None:
+        """Establish the stream; raise ConnectionError if the peer is gone."""
+        ...
+
+    async def receive_messages(self) -> bool:
+        """Feed receive() while the session runs; return True on input overflow.
+
+        On normal input end, arrange for receive() to return None after queued
+        events are drained, then return False. Raise ConnectionError on a
+        disconnection so the handler cancels session processing immediately.
+        """
+        ...
 
     async def receive(self) -> dict[str, Any] | None:
         """Receive an event object; raise ValueError for an invalid envelope.
@@ -35,29 +53,44 @@ class RealtimeTransport(Protocol):
         ...
 
     async def finish(self, reason: FinishReason = "normal") -> None:
-        """Finish this stream, including when sending the last event failed."""
+        """Close the stream, tolerating a lost peer or an already closed stream."""
+        ...
+
+    def clear_pending_messages(self) -> None:
+        """Release pending input after the receiver and session have stopped."""
         ...
 
 
 class WebSocketRealtimeTransport:
     """Queue WebSocket input while the session awaits inference.
 
-    The endpoint runs receive_messages concurrently with the session and stops
-    both on disconnect or overflow. Only the session consumes and sends events.
+    The handler runs receive_messages concurrently with the session and stops
+    both on disconnect or overflow. The session consumes queued events serially.
     """
 
-    def __init__(self, websocket: WebSocket, max_pending_bytes: int) -> None:
+    def __init__(
+        self, websocket: WebSocket, max_pending_bytes: int = _MAX_PENDING_INPUT_BYTES
+    ) -> None:
         self.websocket = websocket
         self._max_pending_bytes = max_pending_bytes
         self._incoming_messages: asyncio.Queue[tuple[dict, int]] = asyncio.Queue()
         self._pending_input_bytes = 0
 
+    async def open(self) -> None:
+        try:
+            await self.websocket.accept()
+        except (WebSocketDisconnect, RuntimeError) as e:
+            raise ConnectionError("Cannot open realtime WebSocket") from e
+
     async def receive_messages(self) -> bool:
-        """Queue raw messages; return True on overflow, False on disconnect."""
+        """Queue raw messages until overflow or disconnection."""
         while True:
-            message = await self.websocket.receive()
+            try:
+                message = await self.websocket.receive()
+            except (WebSocketDisconnect, RuntimeError) as e:
+                raise ConnectionError("Realtime WebSocket is closed") from e
             if message["type"] == "websocket.disconnect":
-                return False
+                raise ConnectionError("Realtime WebSocket is closed")
             # Include JSON/base64 payloads and overhead even for empty frames.
             size = (
                 len((message.get("text") or "").encode("utf-8"))

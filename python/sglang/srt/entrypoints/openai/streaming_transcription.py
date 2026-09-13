@@ -29,8 +29,11 @@ _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 
 @dataclass
-class StreamingASRState:
-    """State for chunk-based streaming ASR with prefix rollback.
+class CumulativeTranscriptState:
+    """Cumulative transcript candidates with prefix rollback.
+
+    Published text belongs to the caller and is supplied to each operation.
+    Updating a candidate never records publication.
 
     Parameters are model-specific and should be provided via the
     adapter's ``chunked_streaming_config``.
@@ -45,30 +48,21 @@ class StreamingASRState:
     unfixed_chunk_num: int
     unfixed_token_num: int
     confirmed_text: str = ""
-    # Monotonic accumulator; used as prompt prefix so the model sees a
-    # natural continuation point, not the rolled-back ``confirmed_text``.
-    emitted_text: str = ""
     full_transcript: str = ""
     chunk_index: int = 0
 
-    def get_prefix_text(self) -> str:
-        if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
+    def get_prefix_text(self, *, emitted_text: str) -> str:
+        if self.chunk_index < self.unfixed_chunk_num or not emitted_text:
             return ""
-        return self.emitted_text
+        return emitted_text
 
-    def accept_candidate(self, candidate: "StreamingASRState") -> None:
-        """Adopt a reconciled hypothesis, preserving text actually published."""
-        self.confirmed_text = candidate.confirmed_text
-        self.full_transcript = candidate.full_transcript
-        self.chunk_index = candidate.chunk_index
-
-    def update(self, new_transcript: str) -> str:
+    def update(self, new_transcript: str, *, emitted_text: str) -> str:
         """Update the candidate hypothesis; the caller publishes the delta."""
         # A shorter continuation can move holdback into the supplied prefix.
         # Keep that published boundary when it belongs to this hypothesis.
         old_confirmed = (
-            self.emitted_text
-            if new_transcript.startswith(self.emitted_text)
+            emitted_text
+            if new_transcript.startswith(emitted_text)
             else self.confirmed_text
         )
         words = new_transcript.split()
@@ -87,7 +81,7 @@ class StreamingASRState:
         common_count = common_unit_prefix(old_words, new_words)
         return join_text("", " ".join(new_words[common_count:]))
 
-    def unpublished_text(self, *, split_cjk: bool = False) -> str:
+    def unpublished_text(self, *, emitted_text: str, split_cjk: bool = False) -> str:
         """Read the candidate tail without publishing or changing state.
 
         Cumulative finalization retains its whitespace-word rollback. Window
@@ -96,8 +90,8 @@ class StreamingASRState:
         """
         text = join_text("", self.full_transcript)
         confirmed = self.confirmed_text
-        if text.startswith(self.emitted_text):
-            confirmed = self.emitted_text
+        if text.startswith(emitted_text):
+            confirmed = emitted_text
             remainder = text[len(confirmed) :]
             # Preserve punctuation added after the published word, without
             # allowing an extension that the wire would split mid-word.
@@ -115,9 +109,9 @@ class StreamingASRState:
         tail = full_units[common:]
         return join_units(tail) if split_cjk else " ".join(tail)
 
-    def finalize(self) -> str:
+    def finalize(self, *, emitted_text: str) -> str:
         """Finalize the hypothesis; publishing and recording remain separate."""
-        delta = join_text("", self.unpublished_text())
+        delta = join_text("", self.unpublished_text(emitted_text=emitted_text))
         self.confirmed_text = join_text("", self.full_transcript)
         return delta
 
@@ -191,19 +185,24 @@ def needs_space(prev: str, cur: str) -> bool:
     return True
 
 
-async def process_asr_chunk(
+async def process_transcription_chunk(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
-    state: StreamingASRState,
+    state: CumulativeTranscriptState,
     audio_data: bytes,
     sampling_params: Dict[str, Any],
     is_last: bool,
+    *,
+    emitted_text: str,
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
 ) -> str:
-    """Run and reconcile one cumulative chunk for HTTP streaming ASR."""
-    decoder_prefix = state.get_prefix_text()
-    result = await generate_asr_transcript(
+    """Update a caller-owned candidate for one HTTP streaming chunk.
+
+    The caller accepts this candidate after publishing its returned delta.
+    """
+    decoder_prefix = state.get_prefix_text(emitted_text=emitted_text)
+    result = await generate_transcript(
         tokenizer_manager=tokenizer_manager,
         adapter=adapter,
         decoder_prefix=decoder_prefix,
@@ -215,7 +214,7 @@ async def process_asr_chunk(
     if result is None:
         return ""
     return apply_cumulative_transcript(
-        state, decoder_prefix + result.text, is_last=is_last
+        state, decoder_prefix + result.text, is_last=is_last, emitted_text=emitted_text
     )
 
 
@@ -301,7 +300,7 @@ def common_unit_prefix(
     return count
 
 
-class ASRBackendAborted(RuntimeError):
+class TranscriptionBackendAborted(RuntimeError):
     """The backend aborted the request instead of finishing it."""
 
     def __init__(self, message: str, *, status_code: Optional[int] = None):
@@ -323,7 +322,7 @@ class GeneratedTranscript(msgspec.Struct, frozen=True):
     finish_reason: Optional[str]
 
 
-async def generate_asr_transcript(
+async def generate_transcript(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
     audio_data: Union[bytes, np.ndarray],
@@ -377,7 +376,7 @@ async def generate_asr_transcript(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 ):
                     raise
-                raise ASRBackendAborted(
+                raise TranscriptionBackendAborted(
                     str(error.detail), status_code=error.status_code
                 ) from error
             _raise_for_aborted_response(ret)
@@ -423,16 +422,16 @@ def _raise_for_aborted_response(response: Dict[str, Any]) -> None:
     status_code = (
         finish_reason.get("status_code") if isinstance(finish_reason, dict) else None
     )
-    raise ASRBackendAborted(
+    raise TranscriptionBackendAborted(
         message or "ASR backend request aborted", status_code=status_code
     )
 
 
 def apply_cumulative_transcript(
-    state: StreamingASRState, text: str, *, is_last: bool
+    state: CumulativeTranscriptState, text: str, *, is_last: bool, emitted_text: str
 ) -> str:
     """Apply a cumulative hypothesis to the shared rollback state."""
     if is_last:
         state.full_transcript = text
-        return state.finalize()
-    return state.update(text)
+        return state.finalize(emitted_text=emitted_text)
+    return state.update(text, emitted_text=emitted_text)

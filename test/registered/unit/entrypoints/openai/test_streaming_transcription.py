@@ -13,11 +13,11 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.entrypoints.openai.streaming_asr import (
-    ASRBackendAborted,
-    StreamingASRState,
+from sglang.srt.entrypoints.openai.streaming_transcription import (
+    CumulativeTranscriptState,
+    TranscriptionBackendAborted,
     apply_cumulative_transcript,
-    generate_asr_transcript,
+    generate_transcript,
     join_text,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -26,66 +26,68 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _publish(state, delta):
-    state.emitted_text = join_text(state.emitted_text, delta)
-    return delta
-
-
-class TestStreamingASRState(CustomTestCase):
+class TestCumulativeTranscriptState(CustomTestCase):
     def test_holdback_and_revision_without_prefix(self):
-        state = StreamingASRState(2.0, 2, 1)
-        self.assertEqual(_publish(state, state.update("one two three")), "one two")
-        self.assertEqual(_publish(state, state.update("one two three four")), "three")
-        self.assertEqual(state.get_prefix_text(), "one two three")
-        self.assertEqual(state.finalize(), "four")
-        state = StreamingASRState(2.0, 3, 1)
+        state = CumulativeTranscriptState(2.0, 2, 1)
+        emitted_text = ""
+        delta = state.update("one two three", emitted_text=emitted_text)
+        self.assertEqual(delta, "one two")
+        emitted_text = join_text(emitted_text, delta)
+        delta = state.update("one two three four", emitted_text=emitted_text)
+        self.assertEqual(delta, "three")
+        emitted_text = join_text(emitted_text, delta)
         self.assertEqual(
-            [
-                _publish(state, state.update(text))
-                for text in ("a tail", "b tail", "b tail")
-            ],
-            ["a", "b", ""],
+            state.get_prefix_text(emitted_text=emitted_text), "one two three"
         )
-        self.assertEqual(state.finalize(), "tail")
-        state = StreamingASRState(2.0, 2, 5)
-        self.assertEqual(state.update("今天北京天气晴朗"), "")
-        self.assertEqual(state.update("今天上海天气晴朗"), "")
-        self.assertEqual(state.finalize(), "今天上海天气晴朗")
+        self.assertEqual(state.finalize(emitted_text=emitted_text), "four")
+        state = CumulativeTranscriptState(2.0, 3, 1)
+        emitted_text, deltas = "", []
+        for text in ("a tail", "b tail", "b tail"):
+            delta = state.update(text, emitted_text=emitted_text)
+            deltas.append(delta)
+            emitted_text = join_text(emitted_text, delta)
+        self.assertEqual(deltas, ["a", "b", ""])
+        self.assertEqual(state.finalize(emitted_text=emitted_text), "tail")
+        state = CumulativeTranscriptState(2.0, 2, 5)
+        self.assertEqual(state.update("今天北京天气晴朗", emitted_text=""), "")
+        self.assertEqual(state.update("今天上海天气晴朗", emitted_text=""), "")
+        self.assertEqual(state.finalize(emitted_text=""), "今天上海天气晴朗")
 
     def test_punctuation_remainder_does_not_repeat_the_published_word(self):
-        state = StreamingASRState(2.0, 2, 1)
-        self.assertEqual(_publish(state, state.update("Hello pending")), "Hello")
-        delta = apply_cumulative_transcript(state, "Hello,  world", is_last=True)
+        state = CumulativeTranscriptState(2.0, 2, 1)
+        delta = state.update("Hello pending", emitted_text="")
+        self.assertEqual(delta, "Hello")
+        emitted_text = join_text("", delta)
+        delta = apply_cumulative_transcript(
+            state, "Hello,  world", is_last=True, emitted_text=emitted_text
+        )
         self.assertEqual(delta, ", world")
-        self.assertEqual(state.emitted_text, "Hello")
-        _publish(state, delta)
-        self.assertEqual(state.emitted_text, "Hello" + delta)
-        self.assertEqual(state.finalize(), "")
+        emitted_text = join_text(emitted_text, delta)
+        self.assertEqual(emitted_text, "Hello" + delta)
+        self.assertEqual(state.finalize(emitted_text=emitted_text), "")
 
     def test_repetition_after_prefix_advances_and_an_empty_continuation(self):
-        state = StreamingASRState(2.0, 2, 5)
+        state = CumulativeTranscriptState(2.0, 2, 5)
+        emitted_text = ""
         phrase = "one two three four five six"
         deltas, suffixes = [], []
         for count in range(1, 7):
             reference = " ".join([phrase] * min(count, 4))
-            prefix = state.get_prefix_text()
+            prefix = state.get_prefix_text(emitted_text=emitted_text)
             self.assertTrue(reference.startswith(prefix))
             suffix = "" if count == 5 else reference[len(prefix) :]
             suffixes.append(suffix)
-            deltas.append(
-                _publish(
-                    state,
-                    apply_cumulative_transcript(
-                        state, prefix + suffix, is_last=count == 6
-                    ),
-                )
+            delta = apply_cumulative_transcript(
+                state, prefix + suffix, is_last=count == 6, emitted_text=emitted_text
             )
+            deltas.append(delta)
+            emitted_text = join_text(emitted_text, delta)
         self.assertEqual(suffixes[2], suffixes[3])
-        self.assertEqual(state.emitted_text, reference)
+        self.assertEqual(emitted_text, reference)
         self.assertEqual(" ".join(filter(None, deltas)), reference)
 
 
-class TestASRBackendContract(CustomTestCase):
+class TestTranscriptionBackendContract(CustomTestCase):
     def test_abort_normalization_and_iterator_cleanup(self):
         async def run():
             closed = []
@@ -106,7 +108,7 @@ class TestASRBackendContract(CustomTestCase):
             )
             manager = SimpleNamespace(generate_request=responses)
             frame = {"text": "hello", "meta_info": {"finish_reason": {"type": "stop"}}}
-            result = await generate_asr_transcript(manager, adapter, bytes(4), {})
+            result = await generate_transcript(manager, adapter, bytes(4), {})
             self.assertEqual(
                 (result.text, result.finish_reason, closed), ("hello", "stop", [True])
             )
@@ -121,8 +123,12 @@ class TestASRBackendContract(CustomTestCase):
                 }
             }
             for frame, callback, expected in (
-                (HTTPException(503, "backend failed"), None, ASRBackendAborted),
-                (abort, AsyncMock(), ASRBackendAborted),
+                (
+                    HTTPException(503, "backend failed"),
+                    None,
+                    TranscriptionBackendAborted,
+                ),
+                (abort, AsyncMock(), TranscriptionBackendAborted),
                 (
                     {"text": "hello"},
                     AsyncMock(side_effect=callback_error),
@@ -131,17 +137,17 @@ class TestASRBackendContract(CustomTestCase):
             ):
                 closed.clear()
                 with self.assertRaises(expected) as caught:
-                    await generate_asr_transcript(
+                    await generate_transcript(
                         manager, adapter, bytes(4), {}, on_update=callback
                     )
                 self.assertEqual(closed, [True])
-                if expected is ASRBackendAborted:
+                if expected is TranscriptionBackendAborted:
                     self.assertTrue(caught.exception.retryable)
                 else:
                     self.assertIs(caught.exception, callback_error)
 
         with patch(
-            "sglang.srt.entrypoints.openai.streaming_asr.get_serving",
+            "sglang.srt.entrypoints.openai.streaming_transcription.get_serving",
             return_value=SimpleNamespace(incremental_streaming_output=False),
         ):
             asyncio.run(run())

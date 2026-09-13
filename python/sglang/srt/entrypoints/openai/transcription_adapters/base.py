@@ -25,8 +25,6 @@ class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
     # Complete windows kept in each steady-state request; older audio is
     # represented only by the decoder prefix.
     max_audio_context_windows: int
-    # Primary language codes (lowercase) validated for suffix continuation.
-    supported_languages: tuple[str, ...]
     # Recent emitted text carried into each request as decoder context.
     decoder_prefix_max_tokens: int = 192
     # Agreed units held back from publication to absorb an unstable tail.
@@ -41,24 +39,6 @@ class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
             raise ValueError("decoder_prefix_max_tokens must be positive")
         if self.decoder_prefix_holdback_units < 0:
             raise ValueError("decoder_prefix_holdback_units must be non-negative")
-        if not self.supported_languages or not all(
-            isinstance(language, str) and language.strip()
-            for language in self.supported_languages
-        ):
-            raise ValueError("supported_languages must contain language codes")
-        normalized = tuple(
-            _primary_language(language) for language in self.supported_languages
-        )
-        msgspec.structs.force_setattr(self, "supported_languages", normalized)
-
-    def supports_language(self, language: Optional[str]) -> bool:
-        if not language:
-            return False
-        return _primary_language(language) in self.supported_languages
-
-
-def _primary_language(language: str) -> str:
-    return language.strip().lower().replace("_", "-").split("-", 1)[0]
 
 
 class TranscriptionAdapter(ABC):
@@ -162,7 +142,7 @@ class TranscriptionAdapter(ABC):
 
     @property
     def chunked_streaming_config(self) -> dict:
-        """Parameters for ``StreamingASRState`` when using chunked streaming.
+        """Parameters for ``CumulativeTranscriptState`` when using chunked streaming.
 
         Only used when ``supports_chunked_streaming`` is True.
         Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.

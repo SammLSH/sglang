@@ -50,13 +50,13 @@ from openai.types.realtime.realtime_error import RealtimeError
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
-from sglang.srt.entrypoints.openai.realtime.asr_processor import (
-    RealtimeASRProcessor,
-)
-from sglang.srt.entrypoints.openai.realtime.audio_buffer import (
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
     PCM_SAMPLE_WIDTH_BYTES,
 )
-from sglang.srt.entrypoints.openai.realtime.encoder_window_policy import (
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_processor import (
+    RealtimeTranscriptionProcessor,
+)
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     ResolvedEncoderWindowPolicy,
 )
 from sglang.srt.entrypoints.openai.realtime.protocol import (
@@ -157,13 +157,13 @@ class RealtimeASRSession:
         self.bytes_per_second = self.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
 
         self.config = _SessionConfig()
-        self.asr_processor = RealtimeASRProcessor(
+        self.transcription_processor = RealtimeTranscriptionProcessor(
             tokenizer_manager=tokenizer_manager,
             adapter=adapter,
             encoder_window=encoder_window,
             session_id=self.session_id,
         )
-        self.asr_state = self.asr_processor.create_state()
+        self.transcription_state = self.transcription_processor.create_state()
 
         self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
 
@@ -246,22 +246,20 @@ class RealtimeASRSession:
         # Session updates are patches; omitted nested fields retain their values.
         audio = cfg.audio.input if cfg.audio is not None else None
         audio_fields = audio.model_fields_set if audio is not None else set()
-        transcription_present = "transcription" in audio_fields
-        transcription = audio.transcription if transcription_present else None
+        transcription = audio.transcription if audio is not None else None
 
         new_client_model = self.config.client_model
         new_language = self.config.language
-        if transcription_present:
-            if transcription is None:
-                new_client_model = None
-                new_language = None
-            else:
-                if "model" in transcription.model_fields_set:
-                    new_client_model = transcription.model
-                if "language" in transcription.model_fields_set:
-                    new_language = transcription.language
+        if transcription is not None:
+            if "model" in transcription.model_fields_set:
+                new_client_model = transcription.model
+            if "language" in transcription.model_fields_set:
+                new_language = transcription.language
+        elif "transcription" in audio_fields:
+            new_client_model = None
+            new_language = None
 
-        # Validate first, then mutate config only after the whole update is accepted.
+        # Reject server-side VAD, noise reduction, and transcription prompts.
         if audio is not None and audio.turn_detection is not None:
             await self.send_error(
                 "not_supported",
@@ -284,6 +282,8 @@ class RealtimeASRSession:
                 param="session.audio.input.transcription.prompt",
             )
             return
+
+        # Reject a non-empty model name that differs from the server's model name.
         if (
             new_client_model
             and new_client_model != self.tokenizer_manager.served_model_name
@@ -297,8 +297,11 @@ class RealtimeASRSession:
             )
             return
 
+        # Reject language changes once this item contains audio or decoded text.
+        # The client must commit or clear the item first.
         if new_language != self.config.language and (
-            self.asr_state.has_audio or self.asr_state.has_transcript
+            self.transcription_state.has_audio
+            or self.transcription_state.has_transcript
         ):
             await self.send_error(
                 "invalid_state",
@@ -308,7 +311,9 @@ class RealtimeASRSession:
             )
             return
 
-        new_rate = self.config.input_sample_rate  # default: keep current
+        # Accept only PCM at 16, 24, or 48 kHz. Omitted format keeps the current
+        # rate; null format or a PCM format without a rate resets it to 24 kHz.
+        new_rate = self.config.input_sample_rate
         if "format" in audio_fields:
             fmt = audio.format
             if fmt is None:
@@ -332,9 +337,13 @@ class RealtimeASRSession:
                 return
             else:
                 new_rate = fmt.rate or DEFAULT_INPUT_SAMPLE_RATE
-            # Keep the input sample rate fixed until the current item is
-            # committed or cleared.
-            if new_rate != self.config.input_sample_rate and self.asr_state.has_audio:
+
+            # Reject input rate changes after receiving audio for this item.
+            # The client must commit or clear the item first.
+            if (
+                new_rate != self.config.input_sample_rate
+                and self.transcription_state.has_audio
+            ):
                 await self.send_error(
                     "invalid_state",
                     "Cannot change audio.input.format.rate while audio is "
@@ -343,7 +352,8 @@ class RealtimeASRSession:
                 )
                 return
 
-        # Mutation pass — no early returns past this point.
+        # Save the input rate, model name, and language; build decoder sampling
+        # parameters and mark the session ready to accept audio frames.
         self.config.input_sample_rate = new_rate
         self.config.client_model = new_client_model
         self.config.language = new_language
@@ -352,7 +362,8 @@ class RealtimeASRSession:
         )
         self.config.configured = True
 
-        # Side effects: log + ack.
+        # Log ignored include[] options and required audio resampling, then send
+        # the current input format, model, and language in session.updated.
         if cfg.include:
             logger.info(
                 "[realtime] %s: include[] received but not implemented; ignoring: %s",
@@ -413,14 +424,14 @@ class RealtimeASRSession:
             src_samples * self.model_sample_rate / self.config.input_sample_rate
         )
         if (
-            self.asr_state.audio.received_bytes
+            self.transcription_state.audio.received_bytes
             + target_samples * PCM_SAMPLE_WIDTH_BYTES
-            > self.asr_processor.max_buffer_bytes
+            > self.transcription_processor.max_buffer_bytes
         ):
             await self._send_error_and_finish(
                 "buffer_overflow",
                 "Audio item exceeded "
-                f"{self.asr_processor.max_buffer_bytes / self.bytes_per_second:g}s",
+                f"{self.transcription_processor.max_buffer_bytes / self.bytes_per_second:g}s",
                 reason="buffer_overflow",
             )
             return True
@@ -432,10 +443,10 @@ class RealtimeASRSession:
                 self.config.input_sample_rate,
                 self.model_sample_rate,
             )
-        self.asr_state.audio.append_pcm(data)
+        self.transcription_state.audio.append_pcm(data)
         # A client may batch several chunks in one append; preserve the normal
         # inference cadence instead of turning that payload into one large call.
-        while self.asr_processor.is_chunk_ready(self.asr_state):
+        while self.transcription_processor.is_chunk_ready(self.transcription_state):
             ok = await self._run_inference(is_last=False)
             if not ok:
                 # Stream already finished inside _run_inference.
@@ -448,7 +459,10 @@ class RealtimeASRSession:
         if not self.config.configured:
             await self.send_error("invalid_state", "Send session.update before commit")
             return
-        if not self.asr_state.has_audio and not self.asr_state.has_transcript:
+        if (
+            not self.transcription_state.has_audio
+            and not self.transcription_state.has_transcript
+        ):
             await self.send_error(
                 "invalid_state", "Cannot commit an empty audio buffer"
             )
@@ -456,11 +470,11 @@ class RealtimeASRSession:
 
         # A skipped or truncated intermediate decode leaves its audio unprocessed,
         # forcing one final decode so the item either recovers or fails closed.
-        has_new_audio = self.asr_state.has_new_audio
+        has_new_audio = self.transcription_state.has_new_audio
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
 
-        partial_transcript = self.asr_state.emitted_text
+        partial_transcript = self.transcription_state.emitted_text
 
         await self._send(
             InputAudioBufferCommittedEvent(
@@ -492,10 +506,10 @@ class RealtimeASRSession:
         # Capture pcm duration before `_start_next_item()` runs: starting
         # the next item resets the audio state, so reading it after gives 0.
         pcm_duration_seconds = (
-            self.asr_state.audio.received_bytes / self.bytes_per_second
+            self.transcription_state.audio.received_bytes / self.bytes_per_second
         )
 
-        if has_new_audio or self.asr_state.has_transcript:
+        if has_new_audio or self.transcription_state.has_transcript:
             ok = await self._run_inference(is_last=True)
             if not ok:
                 # _run_inference already emitted transcription.failed and
@@ -508,7 +522,7 @@ class RealtimeASRSession:
                 type="conversation.item.input_audio_transcription.completed",
                 item_id=item_id,
                 content_index=0,
-                transcript=self.asr_state.emitted_text,
+                transcript=self.transcription_state.emitted_text,
                 usage=UsageTranscriptTextUsageDuration(
                     type="duration", seconds=pcm_duration_seconds
                 ),
@@ -538,15 +552,14 @@ class RealtimeASRSession:
         commit-time emits transcription.failed and rolls the item; append-time
         emits a generic error envelope and finishes the stream."""
         try:
-            if is_last and not self.asr_state.has_new_audio:
-                await self.asr_processor.flush_pending_transcript(
-                    self.asr_state, self._emit_transcription_delta
+            if is_last and not self.transcription_state.has_new_audio:
+                await self.transcription_processor.flush_pending_transcript(
+                    self.transcription_state, self._emit_transcription_delta
                 )
             else:
-                await self.asr_processor.process(
-                    self.asr_state,
+                await self.transcription_processor.process(
+                    self.transcription_state,
                     is_last=is_last,
-                    language=self.config.language,
                     sampling_params=self.config.sampling_params,
                     on_transcript_delta=self._emit_transcription_delta,
                 )
@@ -555,7 +568,7 @@ class RealtimeASRSession:
                 "[realtime] inference failed: session=%s item=%s buffer_bytes=%d",
                 self.session_id,
                 self.item.current_item_id,
-                len(self.asr_state.audio.data),
+                len(self.transcription_state.audio.data),
             )
             if is_last:
                 # committed + created already announced this item. Keep
@@ -606,7 +619,7 @@ class RealtimeASRSession:
 
     def _reset_inference_state(self) -> None:
         """Missing any of these resets leaks state across items."""
-        self.asr_state = self.asr_processor.create_state()
+        self.transcription_state = self.transcription_processor.create_state()
 
     def _build_session_info(self) -> TranscriptionSessionConfig:
         # id / object aren't SDK fields; round-trip via extra='allow' so

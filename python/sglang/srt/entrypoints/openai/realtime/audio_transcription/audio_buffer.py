@@ -5,6 +5,8 @@ compacted after inference, but offsets remain absolute until commit or clear,
 so inference policy can keep valid cursors after bytes are dropped.
 """
 
+import asyncio
+
 import msgspec
 import numpy as np
 
@@ -69,3 +71,11 @@ class AudioBuffer(msgspec.Struct):
 
         del self.data[:drop_bytes]
         self.base_offset_bytes += drop_bytes
+
+
+async def snapshot_samples(
+    audio: AudioBuffer, start_offset_bytes: int, end_offset_bytes: int
+) -> np.ndarray:
+    """Copy PCM before converting it off the event loop."""
+    pcm = audio.snapshot(start_offset_bytes, end_offset_bytes)
+    return await asyncio.to_thread(pcm_to_float_samples, pcm)

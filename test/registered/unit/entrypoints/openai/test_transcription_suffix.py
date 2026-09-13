@@ -4,33 +4,33 @@ import re
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.entrypoints.openai.realtime.decoder_suffix import (
-    DecoderSuffixState,
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
     SuffixUpdate,
+    TranscriptionSuffixState,
 )
-from sglang.srt.entrypoints.openai.streaming_asr import join_text
+from sglang.srt.entrypoints.openai.streaming_transcription import join_text
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _pending_state(emitted_text, update):
-    return DecoderSuffixState(
-        emitted_text, update.pending, update.confirmed_pending_chars
+def _pending_state(update):
+    return TranscriptionSuffixState(
+        pending=update.pending, confirmed_pending_chars=update.confirmed_pending_chars
     )
 
 
-class TestDecoderSuffixState(CustomTestCase):
+class TestTranscriptionSuffixState(CustomTestCase):
     def test_agreement_final_pending_and_repeated_speech(self):
-        state = DecoderSuffixState("one", pending="two three four")
+        state = TranscriptionSuffixState(pending="two three four")
         update = state.reconcile("two three five", is_last=False, holdback_units=1)
         self.assertEqual(update, SuffixUpdate(delta="two", pending="three five"))
-        self.assertEqual(state.emitted_text, "one")
-        state = _pending_state("one two", update)
+        self.assertEqual(state.pending, "two three four")
+        state = _pending_state(update)
         update = state.reconcile("", is_last=True, holdback_units=1)
         self.assertEqual(update, SuffixUpdate(delta="three five", pending=""))
-        state = _pending_state("one two three five", update)
+        state = _pending_state(update)
         update = state.reconcile("one two", is_last=True, holdback_units=1)
         self.assertEqual(update, SuffixUpdate(delta="one two", pending=""))
         self.assertEqual(state.flush(), "")
@@ -42,52 +42,53 @@ class TestDecoderSuffixState(CustomTestCase):
         )
         for continuation, expected in (("pet", "carpet"), (" pet", "car pet")):
             with self.subTest(continuation=continuation):
-                state = DecoderSuffixState("", pending="car")
+                state = TranscriptionSuffixState(pending="car")
                 state = _pending_state(
-                    "", state.reconcile("car", is_last=False, holdback_units=1)
+                    state.reconcile("car", is_last=False, holdback_units=1)
                 )
-                self.assertEqual(state.emitted_text, "")
                 self.assertEqual(state.confirmed_pending, "car")
-                self.assertEqual(state.bounded_prefix(tokenizer, 10), "car")
-                self.assertEqual(state.bounded_prefix(tokenizer, 2), "")
+                self.assertEqual(
+                    state.bounded_prefix(tokenizer, 10, emitted_text=""), "car"
+                )
+                self.assertEqual(
+                    state.bounded_prefix(tokenizer, 2, emitted_text=""), ""
+                )
                 state = _pending_state(
-                    "", state.reconcile(continuation, is_last=False, holdback_units=1)
+                    state.reconcile(continuation, is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, "car")
                 self.assertEqual(state.pending, expected)
                 update = state.reconcile(continuation, is_last=False, holdback_units=1)
-                state = _pending_state(update.delta, update)
+                state = _pending_state(update)
                 self.assertEqual(join_text(update.delta, state.flush()), expected)
-                self.assertEqual(state.emitted_text, update.delta)
                 self.assertEqual(state.confirmed_pending_chars, 0)
-        state = DecoderSuffixState("", pending="very very")
+        state = TranscriptionSuffixState(pending="very very")
         update = state.reconcile("very very", is_last=False, holdback_units=1)
         self.assertEqual(update.delta, "very")
-        state = _pending_state("very", update)
+        state = _pending_state(update)
         self.assertEqual(state.flush(), "very")
-        self.assertEqual(state.emitted_text, "very")
 
     def test_punctuation_and_spaces_match_the_published_delta(self):
-        state = DecoderSuffixState("Hello")
+        state = TranscriptionSuffixState()
         update = state.reconcile(",  world", is_last=True, holdback_units=1)
         self.assertEqual(update.delta, ", world")
-        self.assertEqual(state.emitted_text, "Hello")
-        state = DecoderSuffixState("Hello" + update.delta, pending=" ,  again")
+        self.assertEqual(state.pending, "")
+        state = TranscriptionSuffixState(pending=" ,  again")
         self.assertEqual(state.flush(), ", again")
-        self.assertEqual(state.emitted_text, "Hello, world")
+        self.assertEqual(state.pending, "")
         self.assertEqual(state.flush(), "")
 
     def test_revised_holdback_is_not_confirmed_by_normalized_agreement(self):
         for revised in ("Yes.", "yes?", "yesterday"):
             with self.subTest(revised=revised):
-                state = DecoderSuffixState("", pending="yes.")
+                state = TranscriptionSuffixState(pending="yes.")
                 state = _pending_state(
-                    "", state.reconcile(revised, is_last=False, holdback_units=1)
+                    state.reconcile(revised, is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, "")
                 self.assertEqual(state.pending, revised)
                 state = _pending_state(
-                    "", state.reconcile(revised, is_last=False, holdback_units=1)
+                    state.reconcile(revised, is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, revised)
 
@@ -108,9 +109,12 @@ class TestDecoderSuffixState(CustomTestCase):
             ("previous 你好世界", 2, space_tokenizer, "世界"),
         ):
             with self.subTest(source=source, budget=budget):
-                state = DecoderSuffixState(source)
-                self.assertEqual(state.bounded_prefix(tokenizer, budget), expected)
-                self.assertEqual(state.emitted_text, source)
+                state = TranscriptionSuffixState()
+                self.assertEqual(
+                    state.bounded_prefix(tokenizer, budget, emitted_text=source),
+                    expected,
+                )
+                self.assertEqual(state.pending, "")
 
 
 if __name__ == "__main__":
