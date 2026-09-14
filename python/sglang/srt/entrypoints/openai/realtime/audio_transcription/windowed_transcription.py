@@ -1,7 +1,9 @@
-"""Encoder-window input, continuation decoding, and startup configuration.
+"""Transcribe bounded audio context using the model's encoder-window boundaries.
 
-Resolve model defaults and server overrides once at startup, then share the
-immutable result across realtime connections.
+This module selects audio ranges, builds continuation prefixes, and handles
+candidate acceptance and recovery. The multimodal processor partitions features
+into encoder-window items; the scheduler and caches decide which items to encode.
+Model defaults and server overrides are resolved once for all connections.
 """
 
 from __future__ import annotations
@@ -92,7 +94,11 @@ class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
 
 
 class EncoderWindowMode(TranscriptionMode):
-    """Prepare window handoffs and rolling continuations as tentative outcomes."""
+    """Select window-aligned audio and reconcile its transcription continuation.
+
+    Handoff, retries, and PCM retention follow transcript progress. Cache hits
+    only reduce encoder/decoder work; they do not change this mode's state.
+    """
 
     def __init__(
         self,
@@ -143,16 +149,14 @@ class EncoderWindowMode(TranscriptionMode):
         """Snapshot a first handoff or the next rolling continuation request."""
         current = state.mode_state
         if isinstance(current, CumulativeState):
-            snapshot = replace(current, transcript=copy(current.transcript))
             suffix_state = TranscriptionSuffixState()
-            handoff_pending = snapshot.transcript.unpublished_text(
+            handoff_pending = current.transcript.unpublished_text(
                 emitted_text=state.emitted_text
             )
             # Keep cumulative audio until a window candidate is accepted.
             start_offset_bytes = 0
         else:
-            snapshot = replace(current, suffix=copy(current.suffix))
-            suffix_state = snapshot.suffix
+            suffix_state = current.suffix
             handoff_pending = ""
             start_offset_bytes = self._encoder_window_start_offset(
                 state, end_offset_bytes
@@ -175,7 +179,7 @@ class EncoderWindowMode(TranscriptionMode):
             last_attempted_offset_bytes=state.audio.last_attempted_offset_bytes,
             last_processed_offset_bytes=state.audio.last_processed_offset_bytes,
             emitted_text=state.emitted_text,
-            mode_state=snapshot,
+            mode_state=current,
             leading_context_bytes=min(
                 self.encoder_window.context_bytes,
                 start_offset_bytes - state.audio.base_offset_bytes,
@@ -223,7 +227,7 @@ class EncoderWindowMode(TranscriptionMode):
         sampling_params: Dict[str, Any],
         on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
-        """Decode and reconcile against the request's private candidate snapshot."""
+        """Decode and reconcile without modifying the step's accepted text state."""
         before = step.mode_state
         suffix_before = (
             before.suffix
@@ -269,35 +273,33 @@ class EncoderWindowMode(TranscriptionMode):
                 on_update=publish_snapshot if on_candidate is not None else None,
             )
         except TranscriptionBackendAborted as error:
-            # A published continuation cannot be retracted for a retry.
-            if (
-                not error.retryable
-                or step.is_last
-                or state.emitted_text != step.emitted_text
-            ):
-                raise
-            logger.warning(
-                "[realtime] encoder-window ASR step aborted (%s); retaining audio",
-                error,
-            )
-            return self._failed_outcome(step)
+            return self._failed_outcome(state, step, error)
         if generation is None:
-            if step.is_last:
-                raise RuntimeError("final realtime ASR request returned no response")
-            logger.warning("[realtime] encoder-window ASR step returned no response")
-            return self._failed_outcome(step)
-        if generation.finish_reason == "length":
-            if step.is_last or state.emitted_text != step.emitted_text:
-                raise RuntimeError("realtime ASR decode reached max_new_tokens")
-            logger.warning(
-                "[realtime] encoder-window ASR step reached max_new_tokens; "
-                "retaining audio for retry"
+            return self._failed_outcome(
+                state, step, RuntimeError("realtime ASR request returned no response")
             )
-            return self._failed_outcome(step)
+        if generation.finish_reason == "length":
+            return self._failed_outcome(
+                state, step, RuntimeError("realtime ASR decode reached max_new_tokens")
+            )
         return self._reconcile_encoder_window_text(step, suffix_before, generation.text)
 
-    def _failed_outcome(self, step: TranscriptionStep) -> TranscriptionOutcome:
-        """Retain the active mode and audio, or reject an unrecoverable stall."""
+    def _failed_outcome(
+        self,
+        state: RealtimeTranscriptionState,
+        step: TranscriptionStep,
+        error: RuntimeError,
+    ) -> TranscriptionOutcome:
+        """Retry before publication, disable failed handoff, or fail an active mode."""
+        if (
+            step.is_last
+            or state.emitted_text != step.emitted_text
+            or (isinstance(error, TranscriptionBackendAborted) and not error.retryable)
+        ):
+            raise error
+        logger.warning(
+            "[realtime] encoder-window ASR step failed (%s); retaining audio", error
+        )
         before = step.mode_state
         if isinstance(before, CumulativeState):
             failures = before.handoff_failures + 1
@@ -320,6 +322,7 @@ class EncoderWindowMode(TranscriptionMode):
                     "encoder-window ASR failed repeatedly after activation"
                 )
             next_state = replace(before, consecutive_failures=failures)
+        # Record the attempt without advancing processed audio or releasing PCM.
         return TranscriptionOutcome(next_mode_state=next_state, audio_covered=False)
 
     def _reconcile_encoder_window_text(
@@ -328,7 +331,7 @@ class EncoderWindowMode(TranscriptionMode):
         suffix_state: TranscriptionSuffixState,
         text: str,
     ) -> TranscriptionOutcome:
-        """Prepare candidate acceptance and the corresponding PCM release bound."""
+        """Accept decoded text, defer empty continuations, and decide audio coverage."""
         update = suffix_state.reconcile(
             text,
             is_last=step.is_last,

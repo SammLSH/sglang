@@ -24,9 +24,10 @@ TranscriptCandidateCallback = Callable[[str], Awaitable[None]]
 class TranscriptionStep(msgspec.Struct, frozen=True):
     """Request and candidate baseline fixed before generation awaits.
 
-    mode_state contains a private copy of the transcript candidate. Published
-    text and audio cursors are snapshots, so intermediate sends cannot change
-    the reconciliation baseline of this request.
+    The session's single consumer keeps mode_state unchanged during a step.
+    Modes read this accepted state and copy mutable text state before updates.
+    Published text and audio cursors are snapshots, so intermediate sends
+    cannot change the reconciliation baseline of this request.
     """
 
     is_last: bool
@@ -80,7 +81,7 @@ class TranscriptionMode(ABC):
         end_offset_bytes: int,
         is_last: bool,
     ) -> TranscriptionStep:
-        """Snapshot audio bounds, published text, and private candidate state."""
+        """Snapshot audio bounds and published text; reference accepted mode state."""
         ...
 
     @abstractmethod

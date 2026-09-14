@@ -42,7 +42,6 @@ class CumulativeMode(TranscriptionMode):
     ) -> TranscriptionStep:
         current = state.mode_state
         assert isinstance(current, CumulativeState)
-        snapshot = replace(current, transcript=copy(current.transcript))
         return TranscriptionStep(
             is_last=is_last,
             start_offset_bytes=0,
@@ -50,8 +49,8 @@ class CumulativeMode(TranscriptionMode):
             last_attempted_offset_bytes=state.audio.last_attempted_offset_bytes,
             last_processed_offset_bytes=state.audio.last_processed_offset_bytes,
             emitted_text=state.emitted_text,
-            mode_state=snapshot,
-            decoder_prefix=snapshot.transcript.get_prefix_text(
+            mode_state=current,
+            decoder_prefix=current.transcript.get_prefix_text(
                 emitted_text=state.emitted_text
             ),
         )

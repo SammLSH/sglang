@@ -42,7 +42,8 @@ class RealtimeTranscriptionState(msgspec.Struct):
     """One audio item's shared facts and exactly one accepted mode state.
 
     Only the processor appends emitted_text after successful sends.
-    Modes work on snapshots; the processor replaces mode_state at commit.
+    Modes read the accepted mode_state and copy text state before modifying it;
+    the processor replaces mode_state at commit.
     """
 
     audio: AudioBuffer
