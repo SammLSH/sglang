@@ -88,7 +88,6 @@ def _policy(threshold):
             sample_rate=1,
             window_samples=8,
             window_tokens=8,
-            min_tail_samples=4,
             leading_context_samples=2,
         ),
         policy=RealtimeEncoderWindowPolicy(
@@ -283,6 +282,15 @@ class TestRealtimeASR(CustomTestCase):
         expected = "one two three four five six seven eight nine ten"
         self.assertEqual(_transcript(connection), (expected, [expected]))
 
+        # Cumulative CJK previews and their final append retain mixed-script
+        # boundaries through the same publication and flush path.
+        expected = "现在使用API接口继续输出"
+        _, connection = _connection([["现在使用API接口", expected]], streaming=True)
+        self.assertFalse(_append(connection, bytes(4)))
+        self.assertEqual(_events(connection, ".delta")[0]["delta"], "现在使用API")
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        self.assertEqual(_transcript(connection), (expected, [expected]))
+
     def test_failed_send_records_only_successfully_published_text(self):
         _, connection = _connection(
             [["one two three", "one two three four"]], streaming=True
@@ -309,14 +317,24 @@ class TestRealtimeASR(CustomTestCase):
 
     def test_item_audio_limit_still_applies_after_window_fallback(self):
         with get_context().override_server_args(asr_max_buffer_seconds=6):
-            manager, connection = _connection([[], [], ["one two"]], window=True)
-            # Both handoff attempts fail; the same append resumes cumulatively.
-            self.assertFalse(_append(connection, bytes(12)))
-            self.assertEqual(len(manager.requests), 3)
-            self.assertIsNone(manager.requests[-1].mm_processor_kwargs)
-            self.assertTrue(_append(connection, bytes(2)))
-            connection.websocket.close.assert_awaited_once_with(code=1009)
-            self.assertEqual(connection.transcription_state.audio.received_bytes, 12)
+            for window, scripts, sizes in (
+                (False, [["one two"]], [6]),
+                (True, [[], [], ["one two"]], [2, 4, 6]),
+            ):
+                with self.subTest(window=window):
+                    manager, connection = _connection(scripts, window=window)
+                    # Ordinary cumulative mode consumes the append once. With
+                    # windowing, two failed handoffs precede cumulative fallback.
+                    self.assertFalse(_append(connection, bytes(12)))
+                    self.assertEqual(
+                        [len(r.audio_data) for r in manager.requests], sizes
+                    )
+                    self.assertIsNone(manager.requests[-1].mm_processor_kwargs)
+                    self.assertTrue(_append(connection, bytes(2)))
+                    connection.websocket.close.assert_awaited_once_with(code=1009)
+                    self.assertEqual(
+                        connection.transcription_state.audio.received_bytes, 12
+                    )
 
     def test_truncation_retains_audio_and_recovery_preserves_repeated_speech(self):
         manager, connection = _connection(

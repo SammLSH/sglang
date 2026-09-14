@@ -25,6 +25,8 @@ class EncoderWindowSpec(msgspec.Struct, frozen=True):
     alignment_frames: int
     feature_time_dim: int = -1
     mask_key: str = "feature_attention_mask"
+    # Merge shorter tails into the preceding complete window; 0 disables it.
+    merge_tail_below_frames: int = 0
 
     def __post_init__(self):
         if self.window_frames <= 0 or self.alignment_frames <= 0:
@@ -34,6 +36,8 @@ class EncoderWindowSpec(msgspec.Struct, frozen=True):
                 f"encoder window of {self.window_frames} frames is not a multiple of "
                 f"the {self.alignment_frames}-frame encoder block"
             )
+        if not 0 <= self.merge_tail_below_frames <= self.window_frames:
+            raise ValueError("encoder tail merge threshold must be within one window")
 
 
 class EncoderWindowConfig(msgspec.Struct, frozen=True):
@@ -42,8 +46,6 @@ class EncoderWindowConfig(msgspec.Struct, frozen=True):
     sample_rate: int
     window_samples: int
     window_tokens: int
-    # Merge a shorter tail into the preceding window's cache item.
-    min_tail_samples: int
     # Extraction context before the request body, excluded from encoder input.
     leading_context_samples: int
 
@@ -53,7 +55,6 @@ class EncoderWindowConfig(msgspec.Struct, frozen=True):
                 self.sample_rate,
                 self.window_samples,
                 self.window_tokens,
-                self.min_tail_samples,
             )
             <= 0
         ):
@@ -169,10 +170,11 @@ def build_encoder_window_items(
     audio_start = int(positions[0])
     audio_end = audio_start + original_tokens
 
-    # Keep the existing tiny-tail grouping while cutting features, not PCM.
+    # Keep a short tail with its preceding window when the model needs that
+    # grouping to encode it independently of other cache misses.
     window_ends = list(range(spec.window_frames, body_frames + 1, spec.window_frames))
     tail_frames = body_frames % spec.window_frames
-    if window_ends and 0 < tail_frames * samples_per_frame < config.min_tail_samples:
+    if window_ends and 0 < tail_frames < spec.merge_tail_below_frames:
         window_ends.pop()
     if not window_ends or window_ends[-1] < body_frames:
         window_ends.append(body_frames)
@@ -236,6 +238,8 @@ class EncoderWindowMixin:
         raise NotImplementedError
 
     def encoder_window_config(self, *, processor: Any = None) -> EncoderWindowConfig:
+        if self.audio_config.get("truncation", False):
+            raise ValueError("encoder windowing requires audio truncation=False")
         if self._cached_window_config is None:
             processor = self._processor if processor is None else processor
             spec = self.encoder_window_spec()
@@ -251,7 +255,6 @@ class EncoderWindowMixin:
                 window_tokens=self.encoder_window_output_lengths(
                     [spec.window_frames], processor=processor
                 )[0],
-                min_tail_samples=n_fft,
                 # Preserve preceding half-frame samples, rounded to whole hops.
                 leading_context_samples=-(-(n_fft // 2) // hop_length) * hop_length,
             )

@@ -70,7 +70,7 @@ class TestAudioWindows(CustomTestCase):
         self.config = self.owner.encoder_window_config()
         self.audio = (
             np.random.default_rng(7)
-            .normal(0, 0.1, 2 * self.config.window_samples + 4000)
+            .normal(0, 0.1, 3 * self.config.window_samples + 4000)
             .astype(np.float32)
         )
 
@@ -85,9 +85,9 @@ class TestAudioWindows(CustomTestCase):
             MultimodalSpecialTokens(audio_token_id=PLACEHOLDER),
             mm_processor_kwargs=encoder_window_kwargs(leading_context_samples=context),
         )
-        self.assertEqual([item.feature.shape[-1] for item in items], [800, 25])
-        self.assertEqual([item.offsets for item in items], [[(1, 104)], [(105, 108)]])
-        self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 108 + [11])
+        self.assertEqual([item.feature.shape[-1] for item in items], [800, 825])
+        self.assertEqual([item.offsets for item in items], [[(1, 104)], [(105, 212)]])
+        self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 212 + [11])
         # Keep whole-request feature values; exclude extraction context and padding.
         leading_frames = context // self.owner._processor.feature_extractor.hop_length
         valid_frames = int(whole["feature_attention_mask"].sum())
@@ -132,8 +132,11 @@ class TestAudioWindows(CustomTestCase):
                 base, tokens, mm_processor_kwargs=kwargs
             )
             process.assert_called_once()
-        self.assertEqual(len(items), 2)
+        self.assertEqual(len(items), 1)
         self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 108 + [11])
+        self.owner.audio_config = {"truncation": True}
+        with self.assertRaisesRegex(ValueError, "truncation=False"):
+            self.owner.encoder_window_config()
 
 
 class TestAudioBatching(CustomTestCase):

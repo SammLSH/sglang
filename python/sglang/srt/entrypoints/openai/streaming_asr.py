@@ -6,7 +6,17 @@ import unicodedata
 from contextlib import aclosing
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import msgspec
 import numpy as np
@@ -39,10 +49,8 @@ class StreamingASRState:
     Parameters are model-specific and should be provided via the
     adapter's ``chunked_streaming_config``.
 
-    Known limitation: rollback uses str.split() which is ineffective
-    for CJK languages (no whitespace between words).
-    TODO: implement token-level rollback to handle all languages
-    correctly.
+    Holdback counts words and individual CJK characters. Character offsets
+    preserve the candidate's boundary spaces when extending published text.
     """
 
     chunk_size_sec: float
@@ -59,65 +67,41 @@ class StreamingASRState:
 
     def update(self, new_transcript: str, *, emitted_text: str) -> str:
         """Update the candidate hypothesis; the caller publishes the delta."""
-        # A shorter continuation can move holdback into the supplied prefix.
-        # Keep that published boundary when it belongs to this hypothesis.
-        old_confirmed = (
-            emitted_text
-            if new_transcript.startswith(emitted_text)
-            else self.confirmed_text
+        spans = list(iter_unit_spans(new_transcript))
+        confirmed_units = max(0, len(spans) - self.unfixed_token_num)
+        confirmed = (
+            new_transcript[: spans[confirmed_units - 1][1]] if confirmed_units else ""
         )
-        words = new_transcript.split()
-        if len(words) > self.unfixed_token_num:
-            self.confirmed_text = " ".join(words[: -self.unfixed_token_num])
-        else:
-            self.confirmed_text = ""
+        delta = self._unpublished_delta(confirmed, emitted_text=emitted_text)
+        self.confirmed_text = confirmed
         self.full_transcript = new_transcript
         self.chunk_index += 1
-        if self.confirmed_text.startswith(old_confirmed):
-            return join_text("", self.confirmed_text[len(old_confirmed) :].strip())
-        # Model revised earlier text, use word level common prefix to avoid
-        # re-emitting already-sent content and cutting mid-word.
-        old_words = old_confirmed.split()
-        new_words = self.confirmed_text.split()
-        common_count = 0
-        for ow, nw in zip(old_words, new_words):
-            if ow != nw:
-                break
-            common_count += 1
-        return join_text("", " ".join(new_words[common_count:]))
+        return delta
 
-    def unpublished_text(self, *, emitted_text: str, split_cjk: bool = False) -> str:
-        """Read the candidate tail without publishing or changing state.
-
-        Cumulative finalization retains its whitespace-word rollback. Window
-        handoff splits CJK runs into text units, as suffix agreement does.
-        Both use the same exact published boundary and word-extension guard.
-        """
-        text = join_text("", self.full_transcript)
-        confirmed = self.confirmed_text
+    def _unpublished_delta(self, text: str, *, emitted_text: str) -> str:
+        """Return an exact append, retaining rollback before prefix injection."""
         if text.startswith(emitted_text):
-            confirmed = emitted_text
-            remainder = text[len(confirmed) :]
-            # Preserve punctuation added after the published word, without
-            # allowing an extension that the wire would split mid-word.
-            if not remainder or not needs_space(confirmed, remainder):
-                return remainder.lstrip(" ")
-        if split_cjk:
-            confirmed_units = split_units(confirmed)
-            full_units = split_units(self.full_transcript)
-        else:
-            confirmed_units = confirmed.split()
-            full_units = text.split()
-        common = common_unit_prefix(confirmed_units, full_units)
-        if not split_cjk and common == 0 and confirmed_units and full_units:
-            return text
-        tail = full_units[common:]
-        return join_units(tail) if split_cjk else " ".join(tail)
+            return text[len(emitted_text) :]
+        # A shorter continuation can move holdback inside the published prefix.
+        if emitted_text.startswith(text):
+            return ""
+        # Before prefix injection, hypotheses can revise earlier units. Keep
+        # the existing rollback behavior, slicing at the new candidate's offsets.
+        spans = list(iter_unit_spans(text))
+        common = common_unit_prefix(
+            split_units(self.confirmed_text), [text[start:end] for start, end in spans]
+        )
+        tail_start = spans[common - 1][1] if common else 0
+        return join_text(emitted_text, text[tail_start:])[len(emitted_text) :]
+
+    def unpublished_text(self, *, emitted_text: str) -> str:
+        """Read the exact unpublished append for finalization or window handoff."""
+        return self._unpublished_delta(self.full_transcript, emitted_text=emitted_text)
 
     def finalize(self, *, emitted_text: str) -> str:
         """Finalize the hypothesis; publishing and recording remain separate."""
-        delta = join_text("", self.unpublished_text(emitted_text=emitted_text))
-        self.confirmed_text = join_text("", self.full_transcript)
+        delta = self.unpublished_text(emitted_text=emitted_text)
+        self.confirmed_text = self.full_transcript
         return delta
 
 
@@ -231,6 +215,22 @@ async def process_asr_chunk(
     )
 
 
+def iter_unit_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield word and CJK character bounds without reconstructing their spacing."""
+    start = None
+    for index, char in enumerate(text):
+        if char.isspace() or _is_cjk(char):
+            if start is not None:
+                yield start, index
+                start = None
+            if not char.isspace():
+                yield index, index + 1
+        elif start is None:
+            start = index
+    if start is not None:
+        yield start, len(text)
+
+
 def split_units(text: str) -> List[str]:
     """Split text into reconciliation units.
 
@@ -239,20 +239,7 @@ def split_units(text: str) -> List[str]:
     the Latin runs around them stay whole:
     ``"hello 你好，world"`` -> ``["hello", "你", "好", "，", "world"]``.
     """
-    units: List[str] = []
-    for token in text.split():
-        run: List[str] = []
-        for char in token:
-            if _is_cjk(char):
-                if run:
-                    units.append("".join(run))
-                    run = []
-                units.append(char)
-            else:
-                run.append(char)
-        if run:
-            units.append("".join(run))
-    return units
+    return [text[start:end] for start, end in iter_unit_spans(text)]
 
 
 def _space_between(prev: str, cur: str) -> bool:

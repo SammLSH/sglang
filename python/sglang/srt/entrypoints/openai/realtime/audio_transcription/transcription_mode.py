@@ -16,7 +16,8 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-# Receives a candidate continuation relative to TranscriptionStep.emitted_text.
+# Receives an exact append to TranscriptionStep.emitted_text, including boundary
+# spaces. Later candidates may include text already sent by earlier previews.
 TranscriptCandidateCallback = Callable[[str], Awaitable[None]]
 
 
@@ -51,6 +52,8 @@ class TranscriptionOutcome(msgspec.Struct, frozen=True):
 
     next_mode_state: ModeState
     audio_covered: bool
+    # Exact append to the step's published baseline (or the flush baseline).
+    # The publisher sends only the portion not already emitted by previews.
     delta: str = ""
     discard_before_bytes: int | None = None
 

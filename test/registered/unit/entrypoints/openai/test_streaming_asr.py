@@ -18,7 +18,6 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     TranscriptionBackendAborted,
     apply_cumulative_transcript,
     generate_transcript,
-    join_text,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -32,45 +31,53 @@ class TestCumulativeTranscriptState(CustomTestCase):
         emitted_text = ""
         delta = state.update("one two three", emitted_text=emitted_text)
         self.assertEqual(delta, "one two")
-        emitted_text = join_text(emitted_text, delta)
+        emitted_text += delta
         delta = state.update("one two three four", emitted_text=emitted_text)
-        self.assertEqual(delta, "three")
-        emitted_text = join_text(emitted_text, delta)
+        self.assertEqual(delta, " three")
+        emitted_text += delta
         self.assertEqual(
             state.get_prefix_text(emitted_text=emitted_text), "one two three"
         )
-        self.assertEqual(state.finalize(emitted_text=emitted_text), "four")
+        self.assertEqual(state.finalize(emitted_text=emitted_text), " four")
         state = StreamingASRState(2.0, 3, 1)
         emitted_text, deltas = "", []
         for text in ("a tail", "b tail", "b tail"):
             delta = state.update(text, emitted_text=emitted_text)
             deltas.append(delta)
-            emitted_text = join_text(emitted_text, delta)
-        self.assertEqual(deltas, ["a", "b", ""])
-        self.assertEqual(state.finalize(emitted_text=emitted_text), "tail")
-        state = StreamingASRState(2.0, 2, 5)
-        self.assertEqual(state.update("今天北京天气晴朗", emitted_text=""), "")
-        self.assertEqual(state.update("今天上海天气晴朗", emitted_text=""), "")
-        self.assertEqual(state.finalize(emitted_text=""), "今天上海天气晴朗")
+            emitted_text += delta
+        self.assertEqual(deltas, ["a", " b", ""])
+        self.assertEqual(state.finalize(emitted_text=emitted_text), " tail")
+        for text in ("今天北京天气晴朗", "现在使用API接口继续输出"):
+            with self.subTest(text=text):
+                state = StreamingASRState(2.0, 2, 5)
+                emitted_text = state.update(text, emitted_text="")
+                self.assertTrue(emitted_text)
+                extended = text + "然后继续"
+                emitted_text += state.update(extended, emitted_text=emitted_text)
+                self.assertEqual(
+                    state.get_prefix_text(emitted_text=emitted_text), emitted_text
+                )
+                emitted_text += state.finalize(emitted_text=emitted_text)
+                self.assertEqual(emitted_text, extended)
 
     def test_punctuation_remainder_does_not_repeat_the_published_word(self):
         state = StreamingASRState(2.0, 2, 1)
         delta = state.update("Hello pending", emitted_text="")
         self.assertEqual(delta, "Hello")
-        emitted_text = join_text("", delta)
+        emitted_text = delta
         delta = apply_cumulative_transcript(
             state, "Hello,  world", is_last=True, emitted_text=emitted_text
         )
-        self.assertEqual(delta, ", world")
-        emitted_text = join_text(emitted_text, delta)
+        self.assertEqual(delta, ",  world")
+        emitted_text += delta
         self.assertEqual(state.finalize(emitted_text=emitted_text), "")
 
-        # A rejected mid-word extension retains the old handoff boundary.
+        # Exact appends can extend the final published word without repeating it.
         state = StreamingASRState(2.0, 2, 1)
         state.full_transcript = "one twofold three"
         self.assertEqual(
-            state.unpublished_text(emitted_text="one two", split_cjk=True),
-            "twofold three",
+            state.unpublished_text(emitted_text="one two"),
+            "fold three",
         )
 
     def test_repetition_after_prefix_advances_and_an_empty_continuation(self):
@@ -88,10 +95,10 @@ class TestCumulativeTranscriptState(CustomTestCase):
                 state, prefix + suffix, is_last=count == 6, emitted_text=emitted_text
             )
             deltas.append(delta)
-            emitted_text = join_text(emitted_text, delta)
+            emitted_text += delta
         self.assertEqual(suffixes[2], suffixes[3])
         self.assertEqual(emitted_text, reference)
-        self.assertEqual(" ".join(filter(None, deltas)), reference)
+        self.assertEqual("".join(deltas), reference)
 
 
 class TestTranscriptionBackendContract(CustomTestCase):

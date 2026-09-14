@@ -549,8 +549,8 @@ class RealtimeConnection:
                 self.model_sample_rate,
             )
         self.transcription_state.audio.append_pcm(data)
-        # A client may batch several chunks in one append; preserve the normal
-        # inference cadence instead of turning that payload into one large call.
+        # The processor selects the request range; windowing may leave more
+        # inference chunks to drain from a single append.
         while self.transcription_processor.is_chunk_ready(self.transcription_state):
             ok = await self._run_inference(is_last=False)
             if not ok:

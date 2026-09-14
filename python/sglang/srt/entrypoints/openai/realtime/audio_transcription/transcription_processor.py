@@ -35,8 +35,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcr
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
-    join_text,
-    normalize_whitespace,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -129,11 +127,11 @@ class RealtimeTranscriptionProcessor:
     ) -> None:
         """Run one mode, publish its text, then apply the accepted outcome."""
         audio = state.audio
-        # Drain large appends one inference chunk at a time; the final step
-        # covers every received byte.
+        # Window handoff needs the inference chunk cadence. Ordinary cumulative
+        # requests and final requests cover all received audio, as on main.
         end_offset_bytes = (
             audio.received_bytes
-            if is_last
+            if is_last or self._window_mode is None
             else min(
                 audio.received_bytes,
                 audio.last_attempted_offset_bytes + self.chunk_size_bytes,
@@ -203,7 +201,7 @@ class RealtimeTranscriptionProcessor:
         Intermediate revisions are skipped. Final candidates supply
         conflict_error so revisions fail before state or audio is committed.
         """
-        full = normalize_whitespace(join_text(emitted_text_before, candidate))
+        full = emitted_text_before + candidate
         if not full.startswith(state.emitted_text):
             if conflict_error is not None:
                 raise RuntimeError(conflict_error)

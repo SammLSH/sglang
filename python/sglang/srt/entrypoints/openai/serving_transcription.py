@@ -53,7 +53,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcr
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
-    needs_space,
     process_asr_chunk,
     split_audio_chunks,
 )
@@ -773,25 +772,21 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 )
 
                 if delta:
-                    for word in delta.split(" "):
-                        if not word:
-                            continue
-                        content = (
-                            f" {word}" if needs_space(emitted_text, word) else word
-                        )
-                        chunk_resp = TranscriptionStreamResponse(
-                            id=request_id,
-                            created=created_time,
-                            model=model,
-                            choices=[
-                                TranscriptionStreamChoice(
-                                    delta=DeltaMessage(content=content),
-                                    finish_reason=None,
-                                )
-                            ],
-                        )
-                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
-                        emitted_text += content
+                    # The text layer supplies the exact append, including its
+                    # boundary spaces. Send one SSE event for this chunk's delta.
+                    chunk_resp = TranscriptionStreamResponse(
+                        id=request_id,
+                        created=created_time,
+                        model=model,
+                        choices=[
+                            TranscriptionStreamChoice(
+                                delta=DeltaMessage(content=delta),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk_resp.model_dump_json()}\n\n"
+                    emitted_text += delta
 
                 state = candidate
 

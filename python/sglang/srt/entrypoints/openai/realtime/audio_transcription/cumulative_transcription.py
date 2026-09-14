@@ -24,6 +24,7 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_st
 from sglang.srt.entrypoints.openai.streaming_asr import (
     apply_cumulative_transcript,
     generate_transcript,
+    iter_unit_spans,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,8 +75,11 @@ class CumulativeMode(TranscriptionMode):
 
         async def publish_snapshot(text: str) -> None:
             assert on_candidate is not None
-            # Match cumulative word holdback; the last word may be incomplete.
-            snapshot = " ".join((decoder_prefix + text).split()[:-1])
+            # The final unit may still be incomplete. Slice the original text
+            # so mixed-language boundaries match the final candidate exactly.
+            full = decoder_prefix + text
+            spans = list(iter_unit_spans(full))
+            snapshot = full[: spans[-2][1]] if len(spans) > 1 else ""
             if not snapshot or not snapshot.startswith(decoder_prefix):
                 return
             candidate = apply_cumulative_transcript(

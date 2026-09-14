@@ -36,6 +36,8 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_su
 from sglang.srt.entrypoints.openai.streaming_asr import (
     TranscriptionBackendAborted,
     generate_transcript,
+    join_text,
+    normalize_whitespace,
     split_units,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
@@ -144,7 +146,7 @@ class EncoderWindowMode(TranscriptionMode):
             snapshot = replace(current, transcript=copy(current.transcript))
             suffix_state = TranscriptionSuffixState()
             handoff_pending = snapshot.transcript.unpublished_text(
-                emitted_text=state.emitted_text, split_cjk=True
+                emitted_text=state.emitted_text
             )
             # Keep cumulative audio until a window candidate is accepted.
             start_offset_bytes = 0
@@ -248,7 +250,9 @@ class EncoderWindowMode(TranscriptionMode):
                 is_last=step.is_last,
                 holdback_units=self.encoder_window.policy.decoder_prefix_holdback_units,
             ).delta
-            await on_candidate(candidate)
+            await on_candidate(
+                self._format_delta(candidate, emitted_text=step.emitted_text)
+            )
 
         try:
             generation = await generate_transcript(
@@ -367,7 +371,7 @@ class EncoderWindowMode(TranscriptionMode):
                 unconfirmed_start=None if audio_covered else step.start_offset_bytes,
             ),
             audio_covered=audio_covered,
-            delta=update.delta,
+            delta=self._format_delta(update.delta, emitted_text=step.emitted_text),
             discard_before_bytes=(
                 max(0, step.start_offset_bytes - self.encoder_window.context_bytes)
                 if audio_covered and not step.is_last
@@ -383,8 +387,13 @@ class EncoderWindowMode(TranscriptionMode):
         return TranscriptionOutcome(
             next_mode_state=replace(current, suffix=suffix),
             audio_covered=False,
-            delta=delta,
+            delta=self._format_delta(delta, emitted_text=state.emitted_text),
         )
+
+    @staticmethod
+    def _format_delta(delta: str, *, emitted_text: str) -> str:
+        """Format suffix text as an exact append without changing published text."""
+        return join_text(emitted_text, normalize_whitespace(delta))[len(emitted_text) :]
 
 
 def resolve_realtime_encoder_window_policy(

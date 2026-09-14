@@ -69,6 +69,9 @@ class Qwen3ASRMultimodalProcessor(EncoderWindowMixin, BaseMultimodalProcessor):
         return EncoderWindowSpec(
             window_frames=int(audio_config.n_window_infer),
             alignment_frames=alignment_frames,
+            # Each item must contain a full convolution block so a cache hit
+            # on another item cannot change the native encoder's padding.
+            merge_tail_below_frames=alignment_frames,
         )
 
     def compute_mrope_positions(self, input_ids, mm_items):
