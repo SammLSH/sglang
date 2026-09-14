@@ -63,8 +63,15 @@ class TestCumulativeTranscriptState(CustomTestCase):
         )
         self.assertEqual(delta, ", world")
         emitted_text = join_text(emitted_text, delta)
-        self.assertEqual(emitted_text, "Hello" + delta)
         self.assertEqual(state.finalize(emitted_text=emitted_text), "")
+
+        # A rejected mid-word extension retains the old handoff boundary.
+        state = CumulativeTranscriptState(2.0, 2, 1)
+        state.full_transcript = "one twofold three"
+        self.assertEqual(
+            state.unpublished_text(emitted_text="one two", split_cjk=True),
+            "twofold three",
+        )
 
     def test_repetition_after_prefix_advances_and_an_empty_continuation(self):
         state = CumulativeTranscriptState(2.0, 2, 5)

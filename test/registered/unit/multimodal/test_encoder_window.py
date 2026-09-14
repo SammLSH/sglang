@@ -1,11 +1,11 @@
-"""CPU contracts for audio windows, cache identity, and worker isolation."""
+"""CPU contracts for audio windows, batching, cache identity, and worker isolation."""
 
 # ruff: noqa: E402 -- CPU kernel stubs must precede runtime imports.
 
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -18,6 +18,8 @@ from transformers import WhisperFeatureExtractor
 
 from sglang.srt.configs.qwen3_asr import Qwen3ASRProcessor
 from sglang.srt.configs.qwen3_omni import Qwen3OmniMoeAudioEncoderConfig
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.multimodal.encoder_window import (
     build_audio_window_items,
@@ -231,6 +233,53 @@ class TestAudioWindows(CustomTestCase):
             ([], [], []),
         )
         self.assertEqual(owner.audio_window_config(), self.config)
+
+
+def _audio_item(frames, valid_frames=None):
+    batch = len(valid_frames) if valid_frames is not None else 1
+    feature = torch.arange(batch * 4 * frames, dtype=torch.float64).reshape(
+        batch, 4, frames
+    )
+    data = {}
+    if valid_frames is not None:
+        data["feature_attention_mask"] = (
+            torch.arange(frames)[None, :] < torch.tensor(valid_frames)[:, None]
+        )
+    return MultimodalDataItem(
+        modality=Modality.AUDIO, feature=feature, model_specific_data=data
+    )
+
+
+class TestAudioBatching(CustomTestCase):
+    def _assert_encoding(self, items, expected, expected_lengths):
+        tower = Mock(dtype=torch.float32)
+        tower.parameters.return_value = iter([torch.zeros(1)])
+        Qwen3ASRForConditionalGeneration.get_audio_feature(
+            SimpleNamespace(audio_tower=tower), items
+        )
+        features = tower.call_args.args[0]
+        lengths = tower.call_args.kwargs["feature_lens"]
+        self.assertEqual(lengths.tolist(), expected_lengths)
+        self.assertEqual(lengths.dtype, torch.long)
+        self.assertEqual(features.dtype, torch.float32)
+        self.assertTrue(torch.equal(features, expected.float()))
+
+    def test_mixed_masks_preserve_each_batch_row_in_item_order(self):
+        items = [_audio_item(6), _audio_item(10, valid_frames=[2, 9])]
+        expected = torch.cat(
+            [
+                items[0].feature[0],
+                items[1].feature[0, :, :2],
+                items[1].feature[1, :, :9],
+            ],
+            dim=1,
+        )
+        self._assert_encoding(items, expected, [6, 2, 9])
+
+    def test_unmasked_variable_width_items_keep_original_lengths(self):
+        items = [_audio_item(4), _audio_item(7)]
+        expected = torch.cat([items[0].feature[0], items[1].feature[0]], dim=1)
+        self._assert_encoding(items, expected, [4, 7])
 
 
 if __name__ == "__main__":

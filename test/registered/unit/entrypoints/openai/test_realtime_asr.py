@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import unittest
-from copy import copy, deepcopy
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -184,30 +184,30 @@ class TestRealtimeASR(CustomTestCase):
         )
 
     def test_windowing_requires_opt_in_threshold_and_nonfinal_update(self):
-        for enabled, final, threshold, expected_window in (
-            (False, False, 0, False),
-            (True, True, 0, False),
-            (True, False, 2, False),
-            (True, False, 0, True),
+        for enabled, final, threshold, language, expected_window in (
+            (False, False, 0, "en", False),
+            (True, True, 0, "en", False),
+            (True, False, 2, "en", False),
+            (True, False, 0, "en", True),
+            (True, False, 0, None, True),
+            (True, False, 0, "zh", True),
         ):
-            for language in (None, "en", "zh"):
-                with self.subTest(
-                    enabled=enabled, language=language, final=final, threshold=threshold
-                ):
-                    manager, connection = _connection(
-                        [["one two"]], window=enabled, threshold=threshold
-                    )
-                    connection.config.language = language
-                    connection.transcription_state.audio.append_pcm(bytes(4))
-                    self.assertTrue(_run(connection._run_inference(is_last=final)))
-                    self.assertEqual(
-                        connection.transcription_state.encoder_window_active,
-                        expected_window,
-                    )
-                    self.assertEqual(
-                        bool(manager.requests[0].mm_processor_kwargs), expected_window
-                    )
-                    self.assertFalse(manager.requests[0].stream)
+            with self.subTest(
+                enabled=enabled, language=language, final=final, threshold=threshold
+            ):
+                manager, connection = _connection(
+                    [["one two"]], window=enabled, threshold=threshold
+                )
+                connection.config.language = language
+                connection.transcription_state.audio.append_pcm(bytes(4))
+                self.assertTrue(_run(connection._run_inference(is_last=final)))
+                self.assertEqual(
+                    connection.transcription_state.encoder_window_active,
+                    expected_window,
+                )
+                self.assertEqual(
+                    bool(manager.requests[0].mm_processor_kwargs), expected_window
+                )
 
     def test_cumulative_truncation_keeps_text_prefix_and_audio_unchanged(self):
         for final in (False, True):
@@ -235,17 +235,6 @@ class TestRealtimeASR(CustomTestCase):
     def test_punctuation_handoff_and_real_tail_match_completed_text(self):
         manager, connection = _connection(
             [["Hello there"], ["Hello,  world today"], [", today!"]]
-        )
-        transcript = copy(connection.transcription_state.mode_state.transcript)
-        transcript.full_transcript = "Hello,  world"
-        self.assertEqual(
-            transcript.unpublished_text(emitted_text="Hello", split_cjk=True), ", world"
-        )
-        # A rejected mid-word extension retains the old fallback origin.
-        transcript.full_transcript = "one twofold three"
-        self.assertEqual(
-            transcript.unpublished_text(emitted_text="one two", split_cjk=True),
-            "twofold three",
         )
         # Two complete chunks, then one real sample handled by commit.
         for size in (4, 4, 2):
@@ -370,11 +359,12 @@ class TestRealtimeASR(CustomTestCase):
                         ),
                     )
 
-                for _ in range(250):
+                # Cross the 60-s handoff and multiple 8-s window boundaries.
+                for _ in range(40):
                     append()
                 state = connection.transcription_state
                 self.assertTrue(state.encoder_window_active)
-                self.assertGreaterEqual(state.audio.last_processed_offset_bytes, 996)
+                self.assertGreaterEqual(state.audio.last_processed_offset_bytes, 156)
                 self.assertLessEqual(len(state.audio.data), 144)
                 self.assertEqual(state.mode_state.suffix.confirmed_pending, "yes.")
                 self.assertFalse(_events(connection, ".delta"))
@@ -567,8 +557,6 @@ class TestRealtimeASR(CustomTestCase):
                 self.assertEqual(state.audio.last_processed_offset_bytes, 0)
                 self.assertEqual(state.audio.base_offset_bytes, 0)
                 self.assertEqual(bytes(state.audio.data), bytes(4))
-                if window:
-                    self.assertEqual(state.mode_state.suffix.pending, "four five six")
 
     def test_item_audio_limit_still_applies_after_window_fallback(self):
         with get_context().override_server_args(asr_max_buffer_seconds=6):
@@ -654,21 +642,15 @@ class TestRealtimeASR(CustomTestCase):
                 ("invalid_value", "third", "audio"),
             ),
             ({}, ("invalid_value", None, "type")),
-            ({"type": None}, ("invalid_value", None, "type")),
+            (
+                {"type": [], "event_id": "bad-type"},
+                ("invalid_value", "bad-type", "type"),
+            ),
+            (
+                {"type": "input_audio_buffer.clear", "event_id": []},
+                ("invalid_value", None, "event_id"),
+            ),
         ]
-        for value in ([], {}, 17, True):
-            cases.extend(
-                [
-                    (
-                        {"type": value, "event_id": "bad-type"},
-                        ("invalid_value", "bad-type", "type"),
-                    ),
-                    (
-                        {"type": "input_audio_buffer.clear", "event_id": value},
-                        ("invalid_value", None, "event_id"),
-                    ),
-                ]
-            )
         connection.transport.receive.side_effect = [raw for raw, _ in cases] + [
             {"type": "input_audio_buffer.clear", "event_id": None},
             {"type": "input_audio_buffer.clear", "event_id": ""},

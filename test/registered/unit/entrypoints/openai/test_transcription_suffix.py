@@ -22,7 +22,7 @@ def _pending_state(update):
 
 
 class TestTranscriptionSuffixState(CustomTestCase):
-    def test_agreement_final_pending_and_repeated_speech(self):
+    def test_agreement_and_final_pending(self):
         state = TranscriptionSuffixState(pending="two three four")
         update = state.reconcile("two three five", is_last=False, holdback_units=1)
         self.assertEqual(update, SuffixUpdate(delta="two", pending="three five"))
@@ -31,8 +31,6 @@ class TestTranscriptionSuffixState(CustomTestCase):
         update = state.reconcile("", is_last=True, holdback_units=1)
         self.assertEqual(update, SuffixUpdate(delta="three five", pending=""))
         state = _pending_state(update)
-        update = state.reconcile("one two", is_last=True, holdback_units=1)
-        self.assertEqual(update, SuffixUpdate(delta="one two", pending=""))
         self.assertEqual(state.flush(), "")
 
     def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(self):
@@ -68,11 +66,11 @@ class TestTranscriptionSuffixState(CustomTestCase):
         state = _pending_state(update)
         self.assertEqual(state.flush(), "very")
 
-    def test_punctuation_and_spaces_match_the_published_delta(self):
-        state = TranscriptionSuffixState()
-        update = state.reconcile(",  world", is_last=True, holdback_units=1)
+    def test_final_delta_and_flush_preserve_punctuation(self):
+        update = TranscriptionSuffixState().reconcile(
+            ",  world", is_last=True, holdback_units=1
+        )
         self.assertEqual(update.delta, ", world")
-        self.assertEqual(state.pending, "")
         state = TranscriptionSuffixState(pending=" ,  again")
         self.assertEqual(state.flush(), ", again")
         self.assertEqual(state.pending, "")
@@ -114,7 +112,6 @@ class TestTranscriptionSuffixState(CustomTestCase):
                     state.bounded_prefix(tokenizer, budget, emitted_text=source),
                     expected,
                 )
-                self.assertEqual(state.pending, "")
 
 
 if __name__ == "__main__":

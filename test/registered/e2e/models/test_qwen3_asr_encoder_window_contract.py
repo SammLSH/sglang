@@ -1,4 +1,4 @@
-"""Check the checkpoint prompt and probe encoder windows on one natural clip.
+"""Check the checkpoint prompt and short-tail cache-miss encoding.
 
 These comparisons do not establish general encoder equivalence or WER.
 """
@@ -23,7 +23,6 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.multimodal.encoder_window import (
     build_audio_window_items,
     resolve_audio_window_config,
@@ -138,49 +137,6 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         )
         self.assertEqual(rendered, DEFAULT_ASR_PROMPT)
 
-    def test_natural_clip_window_encoding_probe(self):
-        items = self._items(self.audio)
-        self.assertEqual(len(items), 2)
-        features = self.capability.extract_audio_window_features([self.audio])
-        whole_item = MultimodalDataItem(
-            modality=Modality.AUDIO,
-            feature=features.features[0],
-            model_specific_data={"feature_attention_mask": features.masks[0]},
-        )
-        whole = self._embed([whole_item])
-        per_window = torch.cat([self._embed([item]) for item in items])
-        self.assertEqual(tuple(whole.shape), tuple(per_window.shape))
-        cosine = torch.nn.functional.cosine_similarity(whole, per_window, dim=-1).cpu()
-
-        tokens = self.window.window_tokens
-        for index in range(len(items)):
-            segment = cosine[index * tokens : (index + 1) * tokens]
-            with self.subTest(window=index):
-                self.assertGreaterEqual(float(segment.mean()), 0.98)
-                # Check the first token as well as the segment average on
-                # this clip; feature differences can also affect later tokens.
-                self.assertGreaterEqual(float(segment[0]), 0.95)
-        self.assertGreaterEqual(float((cosine >= 0.99).float().mean()), 0.95)
-
-        # Variable-width items share one encoder call and match the per-item
-        # results up to bf16 noise.
-        batched = self._embed(items)
-        self.assertEqual(batched.shape, per_window.shape)
-        self.assertLess(float((batched - per_window).abs().max()), 5e-2)
-
-        # An input item can contain multiple feature rows.
-        repeated = MultimodalDataItem(
-            modality=Modality.AUDIO,
-            feature=items[0].feature.repeat(2, 1, 1),
-            model_specific_data={
-                "feature_attention_mask": items[0].feature_attention_mask.repeat(2, 1)
-            },
-        )
-        grouped = self._embed([repeated, items[1]])
-        expected = torch.cat([per_window[:tokens], per_window])
-        self.assertEqual(grouped.shape, expected.shape)
-        self.assertLess(float((grouped - expected).abs().max()), 5e-2)
-
     def test_tail_cache_miss_numerical_probe(self):
         # Probe partial and complete convolution blocks with and without a
         # preceding complete-window cache miss.
@@ -197,8 +153,8 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
                 relative_error = (cold - hot).norm() / cold.norm()
                 cosine = torch.nn.functional.cosine_similarity(cold, hot, dim=-1)
                 self.assertLess(float(relative_error), 0.05)
-                # Partial blocks exercise the padding fix. Full blocks retain
-                # the baseline batching tolerance checked above.
+                # Partial blocks exercise the padding fix; complete blocks
+                # serve as controls for ordinary bf16 batching differences.
                 if frames < 100:
                     self.assertGreater(float(cosine.min()), 0.999)
 

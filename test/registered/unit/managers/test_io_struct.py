@@ -1079,8 +1079,8 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
         self.assertEqual(req[1].return_hidden_states, "last")
-        self.assertIs(item0.mm_processor_kwargs, kwargs)
-        self.assertIs(req[1].mm_processor_kwargs, kwargs)
+        self.assertEqual(item0.mm_processor_kwargs, kwargs)
+        self.assertEqual(req[1].mm_processor_kwargs, kwargs)
 
     def test_getitem_preserves_return_prompt_token_ids(self):
         """Batch subrequests must keep the prompt-token-id return flag."""
