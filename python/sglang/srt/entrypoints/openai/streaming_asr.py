@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import re
@@ -206,15 +207,23 @@ async def process_asr_chunk(
     The caller accepts this candidate after publishing its returned delta.
     """
     decoder_prefix = state.get_prefix_text(emitted_text=emitted_text)
-    result = await generate_transcript(
-        tokenizer_manager=tokenizer_manager,
-        adapter=adapter,
-        decoder_prefix=decoder_prefix,
-        audio_data=audio_data,
-        sampling_params=sampling_params,
-        raw_request=raw_request,
-        routing_key=routing_key,
-    )
+    try:
+        result = await generate_transcript(
+            tokenizer_manager=tokenizer_manager,
+            adapter=adapter,
+            decoder_prefix=decoder_prefix,
+            audio_data=audio_data,
+            sampling_params=sampling_params,
+            raw_request=raw_request,
+            routing_key=routing_key,
+        )
+    except asyncio.CancelledError:
+        raise
+    except ValueError:
+        logger.warning(
+            "[streaming_asr] chunk %d failed", state.chunk_index, exc_info=True
+        )
+        raise
     if result is None:
         return ""
     return apply_cumulative_transcript(

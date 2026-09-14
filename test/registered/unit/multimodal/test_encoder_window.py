@@ -1,8 +1,7 @@
-"""CPU contracts for audio windows, batching, cache identity, and worker isolation."""
+"""Audio window cache identity, prompt offsets, and encoder batching."""
 
 # ruff: noqa: E402 -- CPU kernel stubs must precede runtime imports.
 
-import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,24 +12,20 @@ maybe_stub_sgl_kernel()  # must precede imports that pull in sgl_kernel
 
 import numpy as np
 import torch
-import uvloop
 from transformers import WhisperFeatureExtractor
 
 from sglang.srt.configs.qwen3_asr import Qwen3ASRProcessor
-from sglang.srt.configs.qwen3_omni import Qwen3OmniMoeAudioEncoderConfig
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
-from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.multimodal.encoder_window import (
-    build_audio_window_items,
-    build_audio_window_processor_kwargs,
+    build_encoder_window_items,
+    encoder_window_kwargs,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.qwen3_asr import Qwen3ASRMultimodalProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,45 +36,18 @@ PLACEHOLDER = 99
 PROMPT_IDS = [10, PLACEHOLDER, 11]
 
 
-class _Tokenizer:
-    bos_token = None
-
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, text, **kwargs):
-        self.calls.append(text)
-        return SimpleNamespace(input_ids=torch.tensor([PROMPT_IDS]))
-
-
-class _Extractor(WhisperFeatureExtractor):
-    def __init__(self):
-        super().__init__(
-            feature_size=128, sampling_rate=16000, hop_length=160, n_fft=400
-        )
-        self.calls = []
-
-    def __call__(self, windows, **kwargs):
-        self.calls.append([len(window) for window in windows])
-        return super().__call__(windows, **kwargs)
-
-
-class _Processor(Qwen3ASRProcessor):
-    """Use the real frontend and length mapping without loading a tokenizer."""
-
-    def __init__(self):
-        self.feature_extractor = _Extractor()
-        self.tokenizer = _Tokenizer()
-        self.length_calls = []
-
-    def _get_feat_extract_output_lengths(self, lengths):
-        self.length_calls.append(list(lengths))
-        return super()._get_feat_extract_output_lengths(lengths)
-
-
 def _owner():
     owner = Qwen3ASRMultimodalProcessor.__new__(Qwen3ASRMultimodalProcessor)
-    owner._processor = _Processor()
+    # Keep the real feature extraction and token-length mapping.
+    processor = Qwen3ASRProcessor.__new__(Qwen3ASRProcessor)
+    processor.feature_extractor = WhisperFeatureExtractor(
+        feature_size=128, sampling_rate=16000, hop_length=160, n_fft=400
+    )
+    processor.tokenizer = Mock(
+        bos_token=None,
+        return_value=SimpleNamespace(input_ids=torch.tensor([PROMPT_IDS])),
+    )
+    owner._processor = processor
     owner._tokenizer = owner._processor.tokenizer
     owner._tokenizer_auto_adds_specials = False
     owner.audio_config = {}
@@ -93,12 +61,12 @@ def _owner():
 
 
 def _items(owner, samples, *, leading_context_samples=0):
-    return build_audio_window_items(
+    return build_encoder_window_items(
         owner,
         samples=samples,
         input_ids=torch.tensor(PROMPT_IDS),
         placeholder_token_id=PLACEHOLDER,
-        config=owner.audio_window_config(),
+        config=owner.encoder_window_config(),
         leading_context_samples=leading_context_samples,
     )
 
@@ -106,45 +74,12 @@ def _items(owner, samples, *, leading_context_samples=0):
 class TestAudioWindows(CustomTestCase):
     def setUp(self):
         self.owner = _owner()
-        self.config = self.owner.audio_window_config()
+        self.config = self.owner.encoder_window_config()
         self.audio = (
             np.random.default_rng(7)
-            .normal(0, 0.1, 3 * self.config.window_samples + 4000)
+            .normal(0, 0.1, 2 * self.config.window_samples + 4000)
             .astype(np.float32)
         )
-
-    def test_config_checks_standalone_and_leading_context_padding(self):
-        owner = _owner()
-        owner.audio_config = {"pad_to_multiple_of": 512}
-        # Standalone extraction passes; only the leading-context probe catches
-        # padding that changes a rolling window's width.
-        standalone = owner.prepare_audio_window(
-            np.zeros(self.config.window_samples, dtype=np.float32)
-        )
-        self.assertEqual(standalone.item.feature.shape[-1], 800)
-        with self.assertRaisesRegex(ValueError, "unpadded frames"):
-            owner.audio_window_config()
-
-    def test_shared_encoder_default_keeps_short_input_padding(self):
-        config = Qwen3OmniMoeAudioEncoderConfig(
-            num_mel_bins=8,
-            encoder_layers=0,
-            d_model=16,
-            downsample_hidden_size=2,
-            output_dim=16,
-        )
-        encoder = Qwen3OmniMoeAudioEncoder(config)
-        widths = []
-        handle = encoder.conv2d1.register_forward_pre_hook(
-            lambda _module, args: widths.append(args[0].shape[-1])
-        )
-        try:
-            with torch.no_grad():
-                output = encoder(torch.zeros(8, 25), feature_lens=torch.tensor([25]))
-        finally:
-            handle.remove()
-        self.assertEqual(widths, [25])
-        self.assertEqual(output.last_hidden_state.shape, (4, 16))
 
     def test_windows_preserve_tails_offsets_and_cache_identity(self):
         window = self.config.window_samples
@@ -190,15 +125,18 @@ class TestAudioWindows(CustomTestCase):
             {"input_features": feature, "attention_mask": torch.tensor([mask])}
             for mask in ([1, 1], [1, 0])
         ]
-        with patch.object(_Extractor, "__call__", side_effect=outputs):
+        with patch.object(WhisperFeatureExtractor, "__call__", side_effect=outputs):
             samples = np.zeros(320, dtype=np.float32)
-            first = self.owner.prepare_audio_window(samples).item
-            shorter = self.owner.prepare_audio_window(samples).item
+            prepared = self.owner.extract_encoder_window_features([samples, samples])
+            first, shorter = [
+                self.owner.make_encoder_window_item(feature, mask, [(0, count - 1)])
+                for feature, mask, count in zip(
+                    prepared.features, prepared.masks, prepared.token_counts
+                )
+            ]
         self.assertNotEqual(first.hash, shorter.hash)
 
-    def test_opt_in_uses_server_config_and_a_cold_worker_clone(self):
-        owner = _owner()
-        source = owner._processor
+    def test_opt_in_uses_server_config(self):
         base = BaseMultiModalProcessorOutput(
             input_text="audio",
             audios=[self.audio[: self.config.window_samples + 4000]],
@@ -207,36 +145,18 @@ class TestAudioWindows(CustomTestCase):
         with patch.object(
             BaseMultimodalProcessor, "process_and_combine_mm_data", return_value="base"
         ) as fallback:
-            self.assertEqual(owner.process_and_combine_mm_data(base, tokens), "base")
-            fallback.assert_called_once()
-        kwargs = build_audio_window_processor_kwargs()
-        kwargs["encoder_window"]["window_samples"] = 1
-        executor = MultimodalProcessorExecutor(lambda: source, max_workers=1)
-        owner.mm_processor_executor = executor
-        loop = uvloop.new_event_loop()
-        try:
-            items, ids, _ = loop.run_until_complete(
-                asyncio.wait_for(
-                    owner.process_and_combine_mm_data_async(
-                        base, tokens, mm_processor_kwargs=kwargs
-                    ),
-                    timeout=10,
-                )
+            self.assertEqual(
+                self.owner.process_and_combine_mm_data(base, tokens), "base"
             )
-        finally:
-            executor.shutdown()
-            loop.close()
+            fallback.assert_called_once()
+
+        kwargs = encoder_window_kwargs()
+        kwargs["encoder_window"]["window_samples"] = 1
+        items, ids, _ = self.owner.process_and_combine_mm_data(
+            base, tokens, mm_processor_kwargs=kwargs
+        )
         self.assertEqual(len(items), 2)
         self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 108 + [11])
-        self.assertEqual(
-            (
-                source.feature_extractor.calls,
-                source.tokenizer.calls,
-                source.length_calls,
-            ),
-            ([], [], []),
-        )
-        self.assertEqual(owner.audio_window_config(), self.config)
 
 
 def _audio_item(frames, valid_frames=None):
@@ -255,21 +175,8 @@ def _audio_item(frames, valid_frames=None):
 
 
 class TestAudioBatching(CustomTestCase):
-    def _assert_encoding(self, items, expected, expected_lengths):
-        tower = Mock(dtype=torch.float32)
-        tower.parameters.return_value = iter([torch.zeros(1)])
-        Qwen3ASRForConditionalGeneration.get_audio_feature(
-            SimpleNamespace(audio_tower=tower), items
-        )
-        features = tower.call_args.args[0]
-        lengths = tower.call_args.kwargs["feature_lens"]
-        self.assertEqual(lengths.tolist(), expected_lengths)
-        self.assertEqual(lengths.dtype, torch.long)
-        self.assertEqual(features.dtype, torch.float32)
-        self.assertTrue(torch.equal(features, expected.float()))
-
-    def test_mixed_masks_preserve_each_batch_row_in_item_order(self):
-        items = [_audio_item(6), _audio_item(10, valid_frames=[2, 9])]
+    def test_variable_widths_preserve_each_batch_row_in_item_order(self):
+        items = [_audio_item(6, valid_frames=[6]), _audio_item(10, valid_frames=[2, 9])]
         expected = torch.cat(
             [
                 items[0].feature[0],
@@ -278,12 +185,18 @@ class TestAudioBatching(CustomTestCase):
             ],
             dim=1,
         )
-        self._assert_encoding(items, expected, [6, 2, 9])
 
-    def test_unmasked_variable_width_items_keep_original_lengths(self):
-        items = [_audio_item(4), _audio_item(7)]
-        expected = torch.cat([items[0].feature[0], items[1].feature[0]], dim=1)
-        self._assert_encoding(items, expected, [4, 7])
+        tower = Mock(dtype=torch.float32)
+        tower.parameters.return_value = iter([torch.zeros(1)])
+        Qwen3ASRForConditionalGeneration.get_audio_feature(
+            SimpleNamespace(audio_tower=tower), items
+        )
+        features = tower.call_args.args[0]
+        lengths = tower.call_args.kwargs["feature_lens"]
+        self.assertEqual(lengths.tolist(), [6, 2, 9])
+        self.assertEqual(lengths.dtype, torch.long)
+        self.assertEqual(features.dtype, torch.float32)
+        self.assertTrue(torch.equal(features, expected.float()))
 
 
 if __name__ == "__main__":

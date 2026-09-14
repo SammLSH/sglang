@@ -35,6 +35,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -363,6 +364,26 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
+
+
+def concat_padded_audio_features(
+    items: List[MultimodalDataItem], *, mask_key: str = "feature_attention_mask"
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Batch audio rows with different frame counts, padding features and masks.
+
+    Features have shape (batch, n_mels, frames). Preserve item and row order;
+    return a mask only when every item supplies one, matching the model's
+    existing mask handling.
+    """
+    features = nn.utils.rnn.pad_sequence(
+        [feature.T for item in items for feature in item.feature], batch_first=True
+    ).permute(0, 2, 1)
+    masks = [getattr(item, mask_key, None) for item in items]
+    if any(mask is None for mask in masks):
+        return features, None
+    return features, nn.utils.rnn.pad_sequence(
+        [row for mask in masks for row in mask], batch_first=True
+    )
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus

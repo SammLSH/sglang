@@ -1,22 +1,15 @@
-"""Prepare independently encodable audio windows for existing multimodal caches.
+"""Opt-in encoder windows for existing multimodal caches.
 
-The shared pipeline plans sample ranges and assigns prompt token offsets. An
-``AudioWindowProcessor`` supplies the server's window config and prepares each
-window's features, model-specific fields, and cache identity. Custom processor
-paths can call ``build_audio_window_items`` directly; the mixin integrates it
-with ``BaseMultimodalProcessor`` and provides default window feature preparation.
-
-Aligned complete windows with the same preceding samples retain their identity.
-Feature extraction still runs on every request. Windowed features need not equal
-whole-clip features; encoder independence and transcription quality require
-model-specific validation. Encoder execution and caching remain in the scheduler.
+Models declare window geometry. The capability separates feature preparation
+from the shared window builder; the mixin supplies default frontend methods and
+integrates the builder with BaseMultimodalProcessor. Encoder execution and cache
+storage remain in the existing multimodal scheduler.
 """
 
 from __future__ import annotations
 
 from typing import (
     Any,
-    Callable,
     Iterator,
     NamedTuple,
     Optional,
@@ -33,12 +26,15 @@ from sglang.srt.managers.mm_utils import hash_feature
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
 
-class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
-    """Server-resolved window sizes in samples and encoder output tokens.
+class EncoderWindowSpec(msgspec.Struct, frozen=True):
+    """Independently encodable feature frames and their encoder block alignment."""
 
-    Callers keep starts window-aligned and retain the same leading samples
-    when rolling. Feature frame sizes and frontend padding are model-owned.
-    """
+    window_frames: int
+    alignment_frames: int
+
+
+class EncoderWindowConfig(msgspec.Struct, frozen=True):
+    """Server-resolved window sizes in samples and encoder output tokens."""
 
     sample_rate: int
     window_samples: int
@@ -69,63 +65,119 @@ class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
         return self.window_samples / self.sample_rate
 
 
-class PreparedAudioWindow(NamedTuple):
-    """One fresh, hashed audio item and its predicted encoder output length.
+class WindowFeatures(NamedTuple):
+    """One feature tensor, valid-frame mask, and token count per window."""
 
-    The item includes every encoder input in its cache identity, including any
-    valid-length masks. The shared pipeline fills its prompt offsets later.
-    """
-
-    item: MultimodalDataItem
-    token_count: int
+    features: list[torch.Tensor]
+    masks: list[torch.Tensor]
+    token_counts: list[int]
 
 
 @runtime_checkable
-class AudioWindowProcessor(Protocol):
-    """Window capability independent of processor inheritance and frontend type.
+class EncoderWindowCapability(Protocol):
+    """What the window builder needs from a processor.
 
-    Implementations opt in only when complete windows are independently
-    encodable. ``processor`` supplies an executor-local frontend when applicable.
+    EncoderWindowMixin supplies defaults except for encoder_window_spec. The
+    defaults use a frontend with centered frames, sampling_rate, hop_length,
+    and n_fft. Models override hooks when their frontend or item layout differs.
     """
 
-    def audio_window_config(
+    def encoder_window_spec(self) -> EncoderWindowSpec: ...
+
+    def encoder_window_config(
         self, *, processor: Any = None
-    ) -> AudioEncoderWindowConfig: ...
+    ) -> EncoderWindowConfig: ...
 
-    def prepare_audio_window(
+    def encoder_window_feature_extractor(self, *, processor: Any = None) -> Any: ...
+
+    def extract_encoder_window_features(
         self,
-        samples: np.ndarray,
+        windows: Sequence[np.ndarray],
         *,
-        leading_context_samples: int = 0,
+        leading_frames: Optional[Sequence[int]] = None,
         processor: Any = None,
-    ) -> PreparedAudioWindow:
-        """Prepare audio including its leading extraction context.
-
-        Exclude that context from encoder positions. Return a fresh item whose
-        encoder output is independent of prompt offsets and other cache misses.
-        """
+    ) -> WindowFeatures:
+        """Extract each window independently, removing its leading context frames."""
         ...
 
+    def encoder_window_output_lengths(
+        self, frame_lens: Sequence[int], *, processor: Any = None
+    ) -> list[int]: ...
 
-def build_audio_window_items(
-    window_processor: AudioWindowProcessor,
+    def make_encoder_window_item(
+        self,
+        feature: torch.Tensor,
+        mask: torch.Tensor,
+        offsets: Sequence[tuple[int, int]],
+    ) -> MultimodalDataItem: ...
+
+    def encoder_window_placeholder_token_id(self, mm_tokens: Any) -> int: ...
+
+
+def resolve_encoder_window_config(
+    cap: EncoderWindowCapability, *, processor: Any = None
+) -> EncoderWindowConfig:
+    """Resolve geometry and probe standalone and leading-context feature shapes."""
+    spec = cap.encoder_window_spec()
+    feature_extractor = cap.encoder_window_feature_extractor(processor=processor)
+    if spec.window_frames <= 0 or spec.alignment_frames <= 0:
+        raise ValueError("encoder window frame counts must be positive")
+    if spec.window_frames % spec.alignment_frames:
+        raise ValueError(
+            f"encoder window of {spec.window_frames} frames is not a multiple of "
+            f"the {spec.alignment_frames}-frame encoder block"
+        )
+    hop_length, n_fft = int(feature_extractor.hop_length), int(feature_extractor.n_fft)
+    if hop_length <= 0 or n_fft <= 0:
+        raise ValueError("feature extractor hop_length and n_fft must be positive")
+    if float(getattr(feature_extractor, "dither", 0.0)) != 0.0:
+        raise ValueError(
+            "encoder windowing requires deterministic feature extraction (dither must be 0)"
+        )
+
+    # Centered frames need preceding half-frame samples, rounded up to whole hops.
+    leading_context_samples = -(-(n_fft // 2) // hop_length) * hop_length
+    config = EncoderWindowConfig(
+        sample_rate=int(feature_extractor.sampling_rate),
+        window_samples=spec.window_frames * hop_length,
+        window_tokens=cap.encoder_window_output_lengths(
+            [spec.window_frames], processor=processor
+        )[0],
+        min_tail_samples=n_fft,
+        leading_context_samples=leading_context_samples,
+    )
+    for leading in (0, leading_context_samples):
+        probe = cap.extract_encoder_window_features(
+            [np.zeros(config.window_samples + leading, dtype=np.float32)],
+            leading_frames=[leading // hop_length],
+            processor=processor,
+        )
+        _validate_audio_window_features(
+            probe.features[0], probe.masks[0], spec.window_frames
+        )
+        if probe.token_counts[0] != config.window_tokens:
+            raise ValueError(
+                f"feature extractor produced {probe.token_counts[0]} encoder tokens for one window; "
+                f"the output-length function predicts {config.window_tokens}"
+            )
+    return config
+
+
+def build_encoder_window_items(
+    cap: EncoderWindowCapability,
     *,
     samples: np.ndarray,
     input_ids: torch.Tensor,
     placeholder_token_id: int,
-    config: AudioEncoderWindowConfig,
+    config: EncoderWindowConfig,
     leading_context_samples: int = 0,
     processor: Any = None,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
-    """Prepare windows and expand one audio placeholder to their token spans.
+    """Split audio, prepare independent windows, and expand one audio placeholder.
 
-    ``samples`` is mono audio at the configured rate, optionally prefixed with
-    the first window's extraction context. Complete windows precede the tail;
-    a sub-minimum remainder is merged into the last window and changes its
-    identity. Each item receives one contiguous, inclusive prompt offset.
-
-    This function accepts any ``AudioWindowProcessor``. It neither tokenizes
-    text nor assumes a feature shape, mask name, or frontend implementation.
+    Complete windows precede the tail. A sub-minimum remainder is merged into
+    the last window and changes its identity. Leading samples provide extraction
+    context and are excluded from encoder positions and prompt token counts.
     """
     samples = np.asarray(samples, dtype=np.float32)
     if samples.ndim != 1:
@@ -146,30 +198,49 @@ def build_audio_window_items(
             f"found {int(positions.numel())}"
         )
     position = int(positions[0])
+    windows = list(_iter_audio_windows(samples, config, leading_context_samples))
+    hop_length = int(
+        cap.encoder_window_feature_extractor(processor=processor).hop_length
+    )
+    prepared = cap.extract_encoder_window_features(
+        [window for window, _, _ in windows],
+        leading_frames=[context // hop_length for _, context, _ in windows],
+        processor=processor,
+    )
+    if (
+        not len(windows)
+        == len(prepared.features)
+        == len(prepared.masks)
+        == len(prepared.token_counts)
+    ):
+        raise ValueError(
+            "feature extraction must return one feature, mask, and token count per window"
+        )
 
     items: list[MultimodalDataItem] = []
     start = position
-    for window, context_samples, complete in _iter_audio_windows(
-        samples, config, leading_context_samples
+    for (_, _, complete), feature, mask, count in zip(
+        windows, prepared.features, prepared.masks, prepared.token_counts
     ):
-        prepared = window_processor.prepare_audio_window(
-            window, leading_context_samples=context_samples, processor=processor
-        )
-        item, count = prepared.item, int(prepared.token_count)
+        count = int(count)
         if count <= 0:
             raise ValueError("audio window produced no encoder tokens")
-        if complete and count != config.window_tokens:
-            raise ValueError(
-                f"complete audio window produced {count} encoder tokens; "
-                f"expected {config.window_tokens}"
+        if complete:
+            _validate_audio_window_features(
+                feature, mask, cap.encoder_window_spec().window_frames
             )
+            if count != config.window_tokens:
+                raise ValueError(
+                    f"complete audio window produced {count} encoder tokens; "
+                    f"expected {config.window_tokens}"
+                )
+        item = cap.make_encoder_window_item(feature, mask, [(start, start + count - 1)])
         if (
             item.modality != Modality.AUDIO
             or item.hash is None
             or item.pad_value is None
         ):
             raise ValueError("audio window processor must return a hashed audio item")
-        item.offsets = [(start, start + count - 1)]
         items.append(item)
         start += count
 
@@ -189,9 +260,7 @@ def build_audio_window_items(
 
 
 def _iter_audio_windows(
-    samples: np.ndarray,
-    config: AudioEncoderWindowConfig,
-    leading_context_samples: int,
+    samples: np.ndarray, config: EncoderWindowConfig, leading_context_samples: int
 ) -> Iterator[tuple[np.ndarray, int, bool]]:
     """Yield each audio view, its leading sample count, and whether it is complete."""
     body_samples = samples.size - leading_context_samples
@@ -221,77 +290,124 @@ def _iter_audio_windows(
         start = end
 
 
-# Requests select windowing and carry leading context; window sizes stay server-owned.
+# Requests select windowing and carry leading context; sizes stay server-owned.
 ENCODER_WINDOW_KWARG = "encoder_window"
 LEADING_CONTEXT_KEY = "leading_context_samples"
+FEATURE_ATTENTION_MASK_KEY = "feature_attention_mask"
 
 
-def build_audio_window_processor_kwargs(*, leading_context_samples: int = 0) -> dict:
+def encoder_window_kwargs(*, leading_context_samples: int = 0) -> dict:
     """Build the mm_processor_kwargs payload for one windowed request."""
     return {ENCODER_WINDOW_KWARG: {LEADING_CONTEXT_KEY: int(leading_context_samples)}}
 
 
-class WindowedAudioProcessorMixin:
-    """Default window integration for ``BaseMultimodalProcessor`` subclasses.
+class EncoderWindowMixin:
+    """Opt-in windowing for BaseMultimodalProcessor subclasses.
 
-    List the mixin before the base class and declare ``audio_encoder_window_spec``
-    to use the default feature preparation. It uses the resolved processor's
-    ``feature_extractor`` and ``_get_feat_extract_output_lengths``, and stores the
-    mask as ``feature_attention_mask``.
-
-    These defaults expect centered feature frames with a fixed hop size and
-    extractor attributes ``sampling_rate``, ``hop_length``, and ``n_fft``.
-
-    Other frontends can override ``resolve_audio_window_config`` and
-    ``prepare_audio_window`` without declaring a frame-based spec. Custom
-    processing paths can implement ``AudioWindowProcessor`` and call the shared
-    builder directly.
+    Declare encoder_window_spec to use the default feature preparation. Override
+    capability methods only where the frontend or multimodal item format differs.
+    The request's processor argument selects the executor-local frontend.
     """
 
-    _cached_window_config: Optional[AudioEncoderWindowConfig] = None
+    _cached_window_config: Optional[EncoderWindowConfig] = None
 
-    def audio_encoder_window_spec(self) -> AudioEncoderWindowSpec:
-        """Declare independently encodable feature frames for the default frontend."""
+    def encoder_window_spec(self) -> EncoderWindowSpec:
         raise NotImplementedError
 
-    def resolve_audio_window_config(
-        self, *, processor: Any = None
-    ) -> AudioEncoderWindowConfig:
-        """Resolve the default window sizes and validate feature shapes."""
-        processor = self._processor if processor is None else processor
-        return resolve_default_audio_window_config(
-            self.audio_encoder_window_spec(),
-            feature_extractor=processor.feature_extractor,
-            output_lengths=processor._get_feat_extract_output_lengths,
-            audio_config=self.audio_config,
-        )
-
-    def prepare_audio_window(
-        self,
-        samples: np.ndarray,
-        *,
-        leading_context_samples: int = 0,
-        processor: Any = None,
-    ) -> PreparedAudioWindow:
-        """Prepare one window using the request's resolved feature extractor."""
-        processor = self._processor if processor is None else processor
-        return prepare_default_audio_window(
-            samples,
-            feature_extractor=processor.feature_extractor,
-            output_lengths=processor._get_feat_extract_output_lengths,
-            window_frames=self.audio_encoder_window_spec().window_frames,
-            mask_key="feature_attention_mask",
-            audio_config=self.audio_config,
-            leading_context_samples=leading_context_samples,
-        )
-
-    def audio_window_config(self, *, processor: Any = None) -> AudioEncoderWindowConfig:
-        """Resolve once at realtime startup, or lazily on the executor's frontend."""
+    def encoder_window_config(self, *, processor: Any = None) -> EncoderWindowConfig:
         if self._cached_window_config is None:
-            self._cached_window_config = self.resolve_audio_window_config(
-                processor=processor
+            self._cached_window_config = resolve_encoder_window_config(
+                self, processor=processor
             )
         return self._cached_window_config
+
+    def encoder_window_feature_extractor(self, *, processor: Any = None) -> Any:
+        processor = self._processor if processor is None else processor
+        return processor.feature_extractor
+
+    def encoder_window_extract_kwargs(self, *, processor: Any = None) -> dict:
+        extractor = self.encoder_window_feature_extractor(processor=processor)
+        required = {
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+            "truncation": False,
+            "padding": "longest",
+            "sampling_rate": int(extractor.sampling_rate),
+        }
+        kwargs = dict(self.audio_config or {})
+        conflicts = sorted(
+            key
+            for key, value in required.items()
+            if key in kwargs and kwargs[key] != value
+        )
+        if conflicts:
+            raise ValueError(
+                "encoder windowing fixes the audio preprocessing values for "
+                + ", ".join(conflicts)
+                + "; remove them from --mm-process-config"
+            )
+        kwargs.update(required)
+        return kwargs
+
+    def extract_encoder_window_features(
+        self,
+        windows: Sequence[np.ndarray],
+        *,
+        leading_frames: Optional[Sequence[int]] = None,
+        processor: Any = None,
+    ) -> WindowFeatures:
+        extractor = self.encoder_window_feature_extractor(processor=processor)
+        kwargs = self.encoder_window_extract_kwargs(processor=processor)
+        if leading_frames is None:
+            leading_frames = [0] * len(windows)
+        features, masks, token_counts = [], [], []
+        # Independent calls keep cache identity independent of request batch size.
+        for window, leading in zip(windows, leading_frames):
+            output = extractor([np.asarray(window, dtype=np.float32)], **kwargs)
+            feature = torch.as_tensor(output["input_features"])
+            mask = torch.as_tensor(output["attention_mask"])
+            if leading:
+                feature = feature[..., leading:].contiguous()
+                mask = mask[..., leading:].contiguous()
+            features.append(feature)
+            masks.append(mask)
+            token_counts.append(
+                self.encoder_window_output_lengths(
+                    [int(mask.sum())], processor=processor
+                )[0]
+            )
+        return WindowFeatures(features, masks, token_counts)
+
+    def encoder_window_output_lengths(
+        self, frame_lens: Sequence[int], *, processor: Any = None
+    ) -> list[int]:
+        processor = self._processor if processor is None else processor
+        return [
+            int(count)
+            for count in processor._get_feat_extract_output_lengths(frame_lens)
+        ]
+
+    def make_encoder_window_item(
+        self,
+        feature: torch.Tensor,
+        mask: torch.Tensor,
+        offsets: Sequence[tuple[int, int]],
+    ) -> MultimodalDataItem:
+        item = MultimodalDataItem(
+            modality=Modality.AUDIO,
+            offsets=list(offsets),
+            feature=feature,
+            model_specific_data={FEATURE_ATTENTION_MASK_KEY: mask},
+        )
+        # Padded features with different valid lengths must not share cached outputs.
+        item.set_hash(hash_feature([feature, mask]))
+        return item
+
+    def encoder_window_placeholder_token_id(self, mm_tokens: Any) -> int:
+        token_id = mm_tokens.get_token_id_by_modality(Modality.AUDIO)
+        if token_id is None:
+            raise ValueError("encoder windowing requires an audio placeholder token id")
+        return token_id
 
     def process_and_combine_mm_data(
         self,
@@ -321,25 +437,22 @@ class WindowedAudioProcessorMixin:
             raise ValueError("encoder windowing requires raw audio samples")
 
         processor, tokenizer = self._resolve_processor(kwargs.get("processor"))
-        config = self.audio_window_config(processor=processor)
-        placeholder_token_id = mm_tokens.get_token_id_by_modality(Modality.AUDIO)
-        if placeholder_token_id is None:
-            raise ValueError("encoder windowing requires an audio placeholder token id")
-        input_ids = self._tokenize_audio_window_prompt(
+        config = self.encoder_window_config(processor=processor)
+        input_ids = self._tokenize_for_encoder_windows(
             tokenizer, base_output.input_text
         )
-        items, input_ids = build_audio_window_items(
+        items, input_ids = build_encoder_window_items(
             self,
             samples=audios[0],
             input_ids=input_ids,
-            placeholder_token_id=placeholder_token_id,
+            placeholder_token_id=self.encoder_window_placeholder_token_id(mm_tokens),
             config=config,
             leading_context_samples=int(window_request.get(LEADING_CONTEXT_KEY, 0)),
             processor=processor,
         )
         return self._finalize_mm_items(items, images=None), input_ids, {}
 
-    def _tokenize_audio_window_prompt(self, tokenizer, input_text: str) -> torch.Tensor:
+    def _tokenize_for_encoder_windows(self, tokenizer, input_text: str) -> torch.Tensor:
         # Preserve the base special-token policy, avoiding a duplicate template BOS.
         add_special_tokens = True
         if self._tokenizer_auto_adds_specials:
@@ -349,142 +462,6 @@ class WindowedAudioProcessorMixin:
         return tokenizer(
             input_text, return_tensors="pt", add_special_tokens=add_special_tokens
         ).input_ids.flatten()
-
-
-# Default preparation for extractors using centered frames and a fixed hop size.
-
-
-class AudioEncoderWindowSpec(msgspec.Struct, frozen=True):
-    """An independently encodable feature span and its encoder block alignment.
-
-    Used by the default config resolver; other frontends can resolve a sample-based
-    ``AudioEncoderWindowConfig`` directly. Declaring frames alone does not prove
-    encoder independence.
-    """
-
-    window_frames: int
-    alignment_frames: int
-
-
-def resolve_default_audio_window_config(
-    spec: AudioEncoderWindowSpec,
-    *,
-    feature_extractor: Any,
-    output_lengths: Callable[[list[int]], Sequence[int] | torch.Tensor],
-    audio_config: Optional[dict] = None,
-) -> AudioEncoderWindowConfig:
-    """Resolve sample ranges and probe standalone and leading-context feature shapes.
-
-    Silent probes validate feature widths and predicted output lengths without
-    running the encoder. Models provide their own frame-to-token length mapping.
-    """
-    if spec.window_frames <= 0 or spec.alignment_frames <= 0:
-        raise ValueError("encoder window frame counts must be positive")
-    if spec.window_frames % spec.alignment_frames:
-        raise ValueError(
-            f"encoder window of {spec.window_frames} frames is not a multiple of "
-            f"the {spec.alignment_frames}-frame encoder block"
-        )
-    hop_length, n_fft = int(feature_extractor.hop_length), int(feature_extractor.n_fft)
-    if hop_length <= 0 or n_fft <= 0:
-        raise ValueError("feature extractor hop_length and n_fft must be positive")
-    if float(getattr(feature_extractor, "dither", 0.0)) != 0.0:
-        raise ValueError(
-            "encoder windowing requires deterministic feature extraction (dither must be 0)"
-        )
-
-    # Centered feature frames need preceding half-frame samples, rounded up to
-    # whole hops.
-    leading_context_samples = -(-(n_fft // 2) // hop_length) * hop_length
-    config = AudioEncoderWindowConfig(
-        sample_rate=int(feature_extractor.sampling_rate),
-        window_samples=spec.window_frames * hop_length,
-        window_tokens=int(output_lengths([spec.window_frames])[0]),
-        min_tail_samples=n_fft,
-        leading_context_samples=leading_context_samples,
-    )
-    for leading in (0, leading_context_samples):
-        feature, mask = _extract_audio_window_features(
-            np.zeros(config.window_samples + leading, dtype=np.float32),
-            feature_extractor=feature_extractor,
-            audio_config=audio_config,
-            leading_context_samples=leading,
-        )
-        _validate_audio_window_features(feature, mask, spec.window_frames)
-        tokens = int(output_lengths([int(mask.sum())])[0])
-        if tokens != config.window_tokens:
-            raise ValueError(
-                f"feature extractor produced {tokens} encoder tokens for one window; "
-                f"the output-length function predicts {config.window_tokens}"
-            )
-    return config
-
-
-def prepare_default_audio_window(
-    samples: np.ndarray,
-    *,
-    feature_extractor: Any,
-    output_lengths: Callable[[list[int]], Sequence[int] | torch.Tensor],
-    window_frames: int,
-    mask_key: str,
-    audio_config: Optional[dict] = None,
-    leading_context_samples: int = 0,
-) -> PreparedAudioWindow:
-    """Prepare one window; the caller selects the mask field and length mapping."""
-    feature, mask = _extract_audio_window_features(
-        samples,
-        feature_extractor=feature_extractor,
-        audio_config=audio_config,
-        leading_context_samples=leading_context_samples,
-    )
-    if len(samples) - leading_context_samples == window_frames * int(
-        feature_extractor.hop_length
-    ):
-        _validate_audio_window_features(feature, mask, window_frames)
-    item = MultimodalDataItem(
-        modality=Modality.AUDIO,
-        feature=feature,
-        model_specific_data={mask_key: mask},
-    )
-    # Identical padded features with different valid lengths must not share KV or embeddings.
-    item.set_hash(hash_feature([feature, mask]))
-    return PreparedAudioWindow(item, int(output_lengths([int(mask.sum())])[0]))
-
-
-def _extract_audio_window_features(
-    samples: np.ndarray,
-    *,
-    feature_extractor: Any,
-    audio_config: Optional[dict],
-    leading_context_samples: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    required = {
-        "return_attention_mask": True,
-        "return_tensors": "pt",
-        "truncation": False,
-        "padding": "longest",
-        "sampling_rate": int(feature_extractor.sampling_rate),
-    }
-    kwargs = dict(audio_config or {})
-    conflicts = sorted(
-        key for key, value in required.items() if key in kwargs and kwargs[key] != value
-    )
-    if conflicts:
-        raise ValueError(
-            "encoder windowing fixes the audio preprocessing values for "
-            + ", ".join(conflicts)
-            + "; remove them from --mm-process-config"
-        )
-    kwargs.update(required)
-    # Per-window calls keep cache identity independent of the request's batch size.
-    output = feature_extractor([np.asarray(samples, dtype=np.float32)], **kwargs)
-    feature = torch.as_tensor(output["input_features"])
-    mask = torch.as_tensor(output["attention_mask"])
-    if leading_context_samples:
-        context_frames = leading_context_samples // int(feature_extractor.hop_length)
-        feature = feature[..., context_frames:].contiguous()
-        mask = mask[..., context_frames:].contiguous()
-    return feature, mask
 
 
 def _validate_audio_window_features(

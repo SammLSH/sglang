@@ -11,6 +11,7 @@ from sglang.srt.configs.qwen3_omni import Qwen3OmniMoeAudioEncoderConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    concat_padded_audio_features,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -58,10 +59,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         if getattr(thinker_config, "audio_config", None) is None:
             thinker_config.audio_config = Qwen3OmniMoeAudioEncoderConfig()
 
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(
-            thinker_config.audio_config,
-            pad_to_full_conv_block=2 * thinker_config.audio_config.n_window == 100,
-        )
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
         self.language_model = Qwen3ForCausalLM(
             thinker_config.text_config,
             quant_config,
@@ -73,48 +71,34 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if not items:
-            raise ValueError("audio encoding requires at least one item")
         device = next(self.audio_tower.parameters()).device
-        masks = [getattr(item, "feature_attention_mask", None) for item in items]
-        mask_device = next((mask.device for mask in masks if mask is not None), None)
-        features, lengths, valid_frames = [], [], []
-        for item, mask in zip(items, masks):
-            feature = item.feature
-            if not isinstance(feature, torch.Tensor) or feature.ndim != 3:
-                raise ValueError(
-                    "audio features must be (batch, n_mels, frames) tensors"
-                )
-            batch, _, frames = feature.shape
-            # Each row is a view: concatenate different durations directly
-            # without padding or copying to flatten a multi-row item.
-            features.extend(feature.unbind(0))
-            if mask_device is None:
-                lengths.extend([frames] * batch)
-            else:
-                if mask is None:
-                    mask = torch.ones(
-                        (batch, frames), dtype=torch.bool, device=mask_device
-                    )
-                lengths.append(mask.sum(dim=1, dtype=torch.long))
-                valid_frames.append(mask.flatten())
 
-        input_features = torch.cat(features, dim=1).to(
-            device=device, dtype=self.audio_tower.dtype
-        )
-        if mask_device is None:
-            audio_feature_lengths = torch.tensor(
-                lengths, dtype=torch.long, device=device
-            )
+        # Items batched across requests can come from different audio
+        # durations, so their mel frame counts differ; pad before concatenating.
+        input_features, feature_attention_mask = concat_padded_audio_features(items)
+        input_features = input_features.type(self.audio_tower.dtype).to(device)
+
+        if feature_attention_mask is not None:
+            feature_attention_mask = feature_attention_mask.type(torch.long).to(device)
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(0, 2, 1)[
+                feature_attention_mask.bool()
+            ].permute(1, 0)
         else:
-            audio_feature_lengths = torch.cat(lengths).to(device)
-            # Select once after concatenation, avoiding per-item GPU boolean
-            # indexing and keeping (n_mels, total_valid_frames) for the encoder.
-            valid = torch.cat(valid_frames).to(device=device, dtype=torch.bool)
-            input_features = input_features[:, valid]
-        return self.audio_tower(
-            input_features, feature_lens=audio_feature_lengths
-        ).last_hidden_state
+            audio_feature_lengths = torch.tensor(
+                [input_features.shape[-1]] * input_features.shape[0],
+                dtype=torch.long,
+                device=device,
+            )
+            input_features = input_features.permute(0, 2, 1).reshape(
+                -1, input_features.shape[1]
+            )
+
+        audio_outputs = self.audio_tower(
+            input_features,
+            feature_lens=audio_feature_lengths,
+        )
+        return audio_outputs.last_hidden_state
 
     def forward(
         self,

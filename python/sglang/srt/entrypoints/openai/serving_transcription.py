@@ -50,7 +50,6 @@ from sglang.srt.entrypoints.openai.realtime import (
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     resolve_realtime_encoder_window_policy,
 )
-from sglang.srt.entrypoints.openai.realtime.transport import WebSocketRealtimeTransport
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
@@ -821,9 +820,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await handle_realtime_transcription(
-            WebSocketRealtimeTransport(websocket),
+            websocket,
             tokenizer_manager=self.tokenizer_manager,
             adapter=self._adapter,
+            server_args=self.tokenizer_manager.server_args,
             session_semaphore=self._session_semaphore,
             encoder_window=self._encoder_window,
         )

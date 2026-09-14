@@ -7,8 +7,8 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from sglang.srt.multimodal.encoder_window import (
-    AudioEncoderWindowSpec,
-    WindowedAudioProcessorMixin,
+    EncoderWindowMixin,
+    EncoderWindowSpec,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -24,7 +24,7 @@ DEFAULT_ASR_PROMPT = (
 )
 
 
-class Qwen3ASRMultimodalProcessor(WindowedAudioProcessorMixin, BaseMultimodalProcessor):
+class Qwen3ASRMultimodalProcessor(EncoderWindowMixin, BaseMultimodalProcessor):
     models = [Qwen3ASRForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -54,7 +54,7 @@ class Qwen3ASRMultimodalProcessor(WindowedAudioProcessorMixin, BaseMultimodalPro
             return DEFAULT_ASR_PROMPT
         return input_text
 
-    def audio_encoder_window_spec(self) -> AudioEncoderWindowSpec:
+    def encoder_window_spec(self) -> EncoderWindowSpec:
         audio_config = self.hf_config.thinker_config.audio_config
         alignment_frames = 2 * int(audio_config.n_window)
         if alignment_frames != 100:
@@ -66,7 +66,7 @@ class Qwen3ASRMultimodalProcessor(WindowedAudioProcessorMixin, BaseMultimodalPro
         # frames at a time and attends within n_window_infer frames, so one
         # n_window_infer-frame window is the smallest independently encodable
         # unit and must hold a whole number of convolution blocks.
-        return AudioEncoderWindowSpec(
+        return EncoderWindowSpec(
             window_frames=int(audio_config.n_window_infer),
             alignment_frames=alignment_frames,
         )

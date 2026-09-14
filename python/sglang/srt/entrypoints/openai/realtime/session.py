@@ -1,4 +1,4 @@
-"""Event handling and transcription state for a realtime ASR session.
+"""WebSocket session for realtime ASR.
 
 Pre-commit deltas reference the reserved current_item_id that the
 subsequent input_audio_buffer.committed and conversation.item.created
@@ -9,6 +9,7 @@ commit-only delta emission.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pybase64
+from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import (
     ConversationItemCreatedEvent,
     InputAudioBufferAppendEvent,
@@ -51,7 +53,7 @@ from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
-    PCM_SAMPLE_WIDTH_BYTES,
+    PCM_SAMPLE_WIDTH_BYTES as _SAMPLE_WIDTH,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_processor import (
     RealtimeTranscriptionProcessor,
@@ -64,19 +66,24 @@ from sglang.srt.entrypoints.openai.realtime.protocol import (
     SUPPORTED_INPUT_SAMPLE_RATES,
     AudioPCM,
     SessionUpdateEvent,
+    TranscriptionSessionAudioInput,
     TranscriptionSessionConfig,
-)
-from sglang.srt.entrypoints.openai.realtime.transport import (
-    FinishReason,
-    RealtimeTransport,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
+
+# 60 s * 48,000 samples/s * 2 bytes/sample (PCM16) * 2 for base64/JSON
+# overhead = 11,520,000 bytes. Raising the item limit must not grow this backlog.
+_MAX_PENDING_INPUT_BYTES = 11_520_000
+
+# Conservative per-frame bookkeeping budget, including empty frames.
+_QUEUED_FRAME_OVERHEAD_BYTES = 256
 
 
 def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
@@ -136,25 +143,29 @@ class _ItemState:
     previous_item_id: Optional[str] = None
 
 
-class RealtimeASRSession:
-    """Dispatch client events serially and maintain transcription state."""
+class RealtimeConnection:
+    """One realtime transcription session. Drives the WS receive loop,
+    dispatches typed client events to the matching _on_* handler, and
+    triggers chunked ASR inference at audio buffer thresholds."""
 
     def __init__(
         self,
-        transport: RealtimeTransport,
+        websocket: WebSocket,
         tokenizer_manager: TokenizerManager,
         adapter: TranscriptionAdapter,
+        server_args: ServerArgs,
         encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
     ) -> None:
-        self.transport = transport
+        self.websocket = websocket
         self.tokenizer_manager = tokenizer_manager
         self.adapter = adapter
+        self.server_args = server_args
 
         self.session_id = f"sess_{random_uuid()}"
         self._current_client_event_id: Optional[str] = None
 
         self.model_sample_rate = adapter.model_sample_rate
-        self.bytes_per_second = self.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
+        self.bytes_per_second = self.model_sample_rate * _SAMPLE_WIDTH
 
         self.config = _SessionConfig()
         self.transcription_processor = RealtimeTranscriptionProcessor(
@@ -166,8 +177,10 @@ class RealtimeASRSession:
         self.transcription_state = self.transcription_processor.create_state()
 
         self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
+        self._incoming_messages: asyncio.Queue[tuple[dict, int]] = asyncio.Queue()
+        self._pending_input_bytes = 0
 
-    async def send_session_created(self) -> None:
+    async def run(self) -> None:
         await self._send(
             SessionCreatedEvent(
                 event_id=f"event_{random_uuid()}",
@@ -176,25 +189,113 @@ class RealtimeASRSession:
             )
         )
 
-    async def run(self) -> None:
-        """Parse and dispatch client events serially.
+        try:
+            # Keep receiving while inference waits, so disconnects and backlog
+            # overflow can cancel the active backend request promptly.
+            receiver_task = asyncio.create_task(self._receive_messages())
+            consumer_task = asyncio.create_task(self._run_loop())
+            overflow = False
+            try:
+                done, _ = await asyncio.wait(
+                    (receiver_task, consumer_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if receiver_task in done:
+                    overflow = receiver_task.result()
+                else:
+                    consumer_task.result()
+            finally:
+                for task in (receiver_task, consumer_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    receiver_task, consumer_task, return_exceptions=True
+                )
+                self._incoming_messages = asyncio.Queue()
+                self._pending_input_bytes = 0
 
-        Validation errors emit an error and continue. Fatal append errors finish
-        the stream and end event processing.
+            if overflow:
+                # Overflow belongs to the connection, not the interrupted event.
+                self._current_client_event_id = None
+                await self._send_error_and_close(
+                    "buffer_overflow",
+                    "Pending realtime input exceeded the session buffer limit; "
+                    "client is sending faster than inference can keep up",
+                    close_code=1009,
+                )
+        except WebSocketDisconnect:
+            logger.info("[realtime] client disconnected: %s", self.session_id)
+        except Exception:
+            logger.exception("[realtime] unexpected error: %s", self.session_id)
+            try:
+                await self._send_error(
+                    "inference_failed",
+                    "Internal server error",
+                    error_type="server_error",
+                )
+            except (WebSocketDisconnect, RuntimeError) as e:
+                logger.debug(
+                    "[realtime] failed to notify client of unexpected error: %s",
+                    e,
+                )
+
+    async def _receive_messages(self) -> bool:
+        """Queue raw WebSocket frames; return True if the backlog exceeds its cap."""
+        while True:
+            try:
+                message = await self.websocket.receive()
+            except RuntimeError as e:
+                raise WebSocketDisconnect() from e
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(code=message.get("code", 1000))
+            size = (
+                len((message.get("text") or "").encode("utf-8"))
+                + len(message.get("bytes") or b"")
+                + _QUEUED_FRAME_OVERHEAD_BYTES
+            )
+            if self._pending_input_bytes + size > _MAX_PENDING_INPUT_BYTES:
+                # Waiting for queue space would hide disconnects behind audio.
+                return True
+            self._pending_input_bytes += size
+            self._incoming_messages.put_nowait((message, size))
+            await asyncio.sleep(0)
+
+    async def _run_loop(self) -> None:
+        """Receive-and-dispatch loop. Validation errors emit an error event
+        and continue; fatal append-path errors (buffer overflow, append-time
+        inference failure) close the WebSocket and terminate the loop.
         """
         while True:
             self._current_client_event_id = None
-            try:
-                raw = await self.transport.receive()
-            except ValueError as e:
-                await self.send_error("invalid_payload", str(e))
+            # A nonempty queue and short handlers may otherwise never yield.
+            await asyncio.sleep(0)
+            message, size = await self._incoming_messages.get()
+            self._pending_input_bytes -= size
+
+            text = message.get("text")
+            if not text:
+                if message.get("bytes") is not None:
+                    # OpenAI Realtime is base64 PCM in JSON; binary frames aren't supported.
+                    await self._send_error(
+                        "invalid_payload",
+                        "Binary frames are not supported on /v1/realtime; "
+                        "use input_audio_buffer.append with base64 audio.",
+                    )
                 continue
-            if raw is None:
-                return
+
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                await self._send_error("invalid_payload", "Invalid JSON")
+                continue
+            if not isinstance(raw, dict):
+                await self._send_error(
+                    "invalid_payload", "Top-level event must be a JSON object"
+                )
+                continue
 
             client_event_id = raw.get("event_id")
             if client_event_id is not None and not isinstance(client_event_id, str):
-                await self.send_error(
+                await self._send_error(
                     "invalid_value",
                     "event_id must be a string or null",
                     param="event_id",
@@ -202,7 +303,7 @@ class RealtimeASRSession:
                 continue
             self._current_client_event_id = client_event_id
             if not isinstance(raw.get("type"), str):
-                await self.send_error(
+                await self._send_error(
                     "invalid_value", "type must be a string", param="type"
                 )
                 continue
@@ -212,14 +313,14 @@ class RealtimeASRSession:
                 # Report first error only; matches OpenAI server behavior.
                 err = e.errors()[0]
                 loc = ".".join(str(x) for x in err["loc"])
-                await self.send_error(
+                await self._send_error(
                     "invalid_value",
                     err.get("msg") or "Invalid payload",
                     param=loc or None,
                 )
                 continue
             if event is None:
-                await self.send_error(
+                await self._send_error(
                     "unknown_event",
                     f"Unknown event type: {raw.get('type')!r}",
                 )
@@ -243,11 +344,40 @@ class RealtimeASRSession:
     async def _on_session_update(self, event: SessionUpdateEvent) -> None:
         cfg = event.session
 
-        # Session updates are patches; omitted nested fields retain their values.
-        audio = cfg.audio.input if cfg.audio is not None else None
-        audio_fields = audio.model_fields_set if audio is not None else set()
-        transcription = audio.transcription if audio is not None else None
+        # Normalize audio to an empty input cfg if absent so downstream
+        # `audio.X is not None` reads as a business rule, not an existence check.
+        # model_fields_set distinguishes omitted fields from explicit nulls.
+        audio = (
+            cfg.audio.input if cfg.audio else None
+        ) or TranscriptionSessionAudioInput()
+        audio_fields = audio.model_fields_set
+        transcription = audio.transcription
 
+        # Reject server-side VAD, noise reduction, and transcription prompts.
+        if audio.turn_detection is not None:
+            await self._send_error(
+                "not_supported",
+                "Server-side VAD is not implemented; "
+                "set audio.input.turn_detection: null and commit explicitly.",
+                param="session.audio.input.turn_detection",
+            )
+            return
+        if audio.noise_reduction is not None:
+            await self._send_error(
+                "not_supported",
+                "audio.input.noise_reduction is not supported; set to null.",
+                param="session.audio.input.noise_reduction",
+            )
+            return
+        if transcription is not None and transcription.prompt is not None:
+            await self._send_error(
+                "not_supported",
+                "audio.input.transcription.prompt is not supported.",
+                param="session.audio.input.transcription.prompt",
+            )
+            return
+
+        # Omitted transcription fields keep their values; explicit null clears.
         new_client_model = self.config.client_model
         new_language = self.config.language
         if transcription is not None:
@@ -259,36 +389,12 @@ class RealtimeASRSession:
             new_client_model = None
             new_language = None
 
-        # Reject server-side VAD, noise reduction, and transcription prompts.
-        if audio is not None and audio.turn_detection is not None:
-            await self.send_error(
-                "not_supported",
-                "Server-side VAD is not implemented; "
-                "set audio.input.turn_detection: null and commit explicitly.",
-                param="session.audio.input.turn_detection",
-            )
-            return
-        if audio is not None and audio.noise_reduction is not None:
-            await self.send_error(
-                "not_supported",
-                "audio.input.noise_reduction is not supported; set to null.",
-                param="session.audio.input.noise_reduction",
-            )
-            return
-        if transcription is not None and transcription.prompt is not None:
-            await self.send_error(
-                "not_supported",
-                "audio.input.transcription.prompt is not supported.",
-                param="session.audio.input.transcription.prompt",
-            )
-            return
-
         # Reject a non-empty model name that differs from the server's model name.
         if (
             new_client_model
             and new_client_model != self.tokenizer_manager.served_model_name
         ):
-            await self.send_error(
+            await self._send_error(
                 "not_supported",
                 f"Model {new_client_model!r} is not served by this endpoint "
                 f"(serving {self.tokenizer_manager.served_model_name!r}); set "
@@ -303,7 +409,7 @@ class RealtimeASRSession:
             self.transcription_state.has_audio
             or self.transcription_state.has_transcript
         ):
-            await self.send_error(
+            await self._send_error(
                 "invalid_state",
                 "Cannot change transcription language while an audio item is "
                 "active; commit or clear the current item first.",
@@ -320,7 +426,7 @@ class RealtimeASRSession:
                 new_rate = DEFAULT_INPUT_SAMPLE_RATE
             elif not isinstance(fmt, AudioPCM):
                 # G.711 (pcmu / pcma): not implemented.
-                await self.send_error(
+                await self._send_error(
                     "not_supported",
                     f"audio.input.format.type must be 'audio/pcm'; "
                     f"{fmt.type!r} is not implemented",
@@ -328,7 +434,7 @@ class RealtimeASRSession:
                 )
                 return
             elif fmt.rate is not None and fmt.rate not in SUPPORTED_INPUT_SAMPLE_RATES:
-                await self.send_error(
+                await self._send_error(
                     "invalid_value",
                     f"audio.input.format.rate must be one of "
                     f"{SUPPORTED_INPUT_SAMPLE_RATES}, got {fmt.rate}",
@@ -344,7 +450,7 @@ class RealtimeASRSession:
                 new_rate != self.config.input_sample_rate
                 and self.transcription_state.has_audio
             ):
-                await self.send_error(
+                await self._send_error(
                     "invalid_state",
                     "Cannot change audio.input.format.rate while audio is "
                     "buffered; commit or clear the current item first.",
@@ -393,7 +499,7 @@ class RealtimeASRSession:
         """Returns True if the session should terminate (buffer overflow or
         append-time inference failure)."""
         if not self.config.configured:
-            await self.send_error(
+            await self._send_error(
                 "invalid_state", "Send session.update before audio frames"
             )
             return False
@@ -405,34 +511,33 @@ class RealtimeASRSession:
         try:
             data = pybase64.b64decode(event.audio, validate=True)
         except (ValueError, TypeError):
-            await self.send_error(
+            await self._send_error(
                 "invalid_audio", "audio field is not valid base64", param="audio"
             )
             return False
 
-        if len(data) % PCM_SAMPLE_WIDTH_BYTES != 0:
-            await self.send_error(
+        if len(data) % _SAMPLE_WIDTH != 0:
+            await self._send_error(
                 "invalid_audio_format",
-                "PCM16 frame length must be a multiple of "
-                f"{PCM_SAMPLE_WIDTH_BYTES} bytes",
+                f"PCM16 frame length must be a multiple of {_SAMPLE_WIDTH} bytes",
             )
             return False
 
         # Estimate post-resample size before resampling so oversized frames fail early.
-        src_samples = len(data) // PCM_SAMPLE_WIDTH_BYTES
+        src_samples = len(data) // _SAMPLE_WIDTH
         target_samples = math.ceil(
             src_samples * self.model_sample_rate / self.config.input_sample_rate
         )
         if (
             self.transcription_state.audio.received_bytes
-            + target_samples * PCM_SAMPLE_WIDTH_BYTES
+            + target_samples * _SAMPLE_WIDTH
             > self.transcription_processor.max_buffer_bytes
         ):
-            await self._send_error_and_finish(
+            await self._send_error_and_close(
                 "buffer_overflow",
                 "Audio item exceeded "
                 f"{self.transcription_processor.max_buffer_bytes / self.bytes_per_second:g}s",
-                reason="buffer_overflow",
+                close_code=1009,
             )
             return True
 
@@ -457,13 +562,13 @@ class RealtimeASRSession:
         self, event: InputAudioBufferCommitEvent
     ) -> None:
         if not self.config.configured:
-            await self.send_error("invalid_state", "Send session.update before commit")
+            await self._send_error("invalid_state", "Send session.update before commit")
             return
         if (
             not self.transcription_state.has_audio
             and not self.transcription_state.has_transcript
         ):
-            await self.send_error(
+            await self._send_error(
                 "invalid_state", "Cannot commit an empty audio buffer"
             )
             return
@@ -550,7 +655,7 @@ class RealtimeASRSession:
     async def _run_inference(self, is_last: bool) -> bool:
         """Run ASR on the current buffer. Returns False on failure:
         commit-time emits transcription.failed and rolls the item; append-time
-        emits a generic error envelope and finishes the stream."""
+        emits a generic error envelope and closes the WebSocket."""
         try:
             if is_last and not self.transcription_state.has_new_audio:
                 await self.transcription_processor.flush_pending_transcript(
@@ -571,8 +676,11 @@ class RealtimeASRSession:
                 len(self.transcription_state.audio.data),
             )
             if is_last:
-                # committed + created already announced this item. Keep
-                # backend details in the log, outside the client error.
+                # Commit-time failure: committed + created already emitted,
+                # so the item exists client-side and transcription.failed
+                # can reference it. Wire message is hardcoded "Transcription
+                # failed" — don't leak backend traces to the client; full
+                # error is in the logger.exception above.
                 await self._send(
                     ConversationItemInputAudioTranscriptionFailedEvent(
                         event_id=f"event_{random_uuid()}",
@@ -591,10 +699,10 @@ class RealtimeASRSession:
                 # Append-time failure: the item isn't visible client-side
                 # yet (committed/created fire at commit), so
                 # transcription.failed would reference a ghost id.
-                await self._send_error_and_finish(
+                await self._send_error_and_close(
                     "inference_failed",
                     "Transcription failed",
-                    reason="server_error",
+                    close_code=1011,
                 )
             return False
 
@@ -647,9 +755,9 @@ class RealtimeASRSession:
         )
 
     async def _send(self, event: BaseModel) -> None:
-        await self.transport.send(event)
+        await self.websocket.send_text(event.model_dump_json())
 
-    async def send_error(
+    async def _send_error(
         self,
         code: str,
         message: str,
@@ -668,29 +776,24 @@ class RealtimeASRSession:
                 event_id=self._current_client_event_id,
             ),
         )
-        await self._send(envelope)
+        await self.websocket.send_text(envelope.model_dump_json())
 
-    async def _send_error_and_finish(
+    async def _send_error_and_close(
         self,
         code: str,
         message: str,
         *,
-        reason: FinishReason,
+        close_code: int,
         error_type: str = "server_error",
     ) -> None:
+        # Independent try-blocks: a failed send must not skip the close.
+        # We still need to release local starlette socket state even when
+        # the wire send doesn't reach the peer.
         try:
-            await self.send_error(code, message, error_type=error_type)
-        except ConnectionError as e:
-            logger.debug("[realtime] send error %s before finish failed: %s", code, e)
-        finally:
-            await self.transport.finish(reason)
-
-    async def send_input_overflow_error(self) -> None:
-        # Queue overflow is a connection failure, not an error in the active event.
-        self._current_client_event_id = None
-        await self._send_error_and_finish(
-            "buffer_overflow",
-            "Pending realtime input exceeded the session buffer limit; "
-            "client is sending faster than inference can keep up",
-            reason="buffer_overflow",
-        )
+            await self._send_error(code, message, error_type=error_type)
+        except (WebSocketDisconnect, RuntimeError) as e:
+            logger.debug("[realtime] send error %s before close failed: %s", code, e)
+        try:
+            await self.websocket.close(code=close_code)
+        except (WebSocketDisconnect, RuntimeError) as e:
+            logger.debug("[realtime] close %d after %s failed: %s", close_code, code, e)
