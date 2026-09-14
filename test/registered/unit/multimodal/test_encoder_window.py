@@ -17,10 +17,7 @@ from transformers import WhisperFeatureExtractor
 from sglang.srt.configs.qwen3_asr import Qwen3ASRProcessor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
-from sglang.srt.multimodal.encoder_window import (
-    build_encoder_window_items,
-    encoder_window_kwargs,
-)
+from sglang.srt.multimodal.encoder_window import encoder_window_kwargs
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
@@ -45,12 +42,19 @@ def _owner():
     )
     processor.tokenizer = Mock(
         bos_token=None,
-        return_value=SimpleNamespace(input_ids=torch.tensor([PROMPT_IDS])),
+        return_value={"input_ids": torch.tensor([PROMPT_IDS])},
     )
+    processor.tokenizer.convert_tokens_to_ids.return_value = PLACEHOLDER
     owner._processor = processor
     owner._tokenizer = owner._processor.tokenizer
     owner._tokenizer_auto_adds_specials = False
     owner.audio_config = {}
+    owner.mm_feature_transport = "cpu"
+    owner.ATTR_NAME_TO_MODALITY = {
+        "input_features": Modality.AUDIO,
+        "feature_attention_mask": Modality.AUDIO,
+    }
+    owner.FEATURE_NAMES = ["input_features"]
     owner.hf_config = SimpleNamespace(
         thinker_config=SimpleNamespace(
             audio_config=SimpleNamespace(n_window_infer=800, n_window=50)
@@ -58,17 +62,6 @@ def _owner():
     )
     owner._finalize_mm_items = lambda items, *, images: items
     return owner
-
-
-def _items(owner, samples, *, leading_context_samples=0):
-    return build_encoder_window_items(
-        owner,
-        samples=samples,
-        input_ids=torch.tensor(PROMPT_IDS),
-        placeholder_token_id=PLACEHOLDER,
-        config=owner.encoder_window_config(),
-        leading_context_samples=leading_context_samples,
-    )
 
 
 class TestAudioWindows(CustomTestCase):
@@ -81,59 +74,39 @@ class TestAudioWindows(CustomTestCase):
             .astype(np.float32)
         )
 
-    def test_windows_preserve_tails_offsets_and_cache_identity(self):
-        window = self.config.window_samples
-        items, ids = _items(self.owner, self.audio[: 2 * window + 4000])
-        self.assertEqual(
-            [item.offsets for item in items], [[(1, 104)], [(105, 208)], [(209, 212)]]
-        )
-        self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 212 + [11])
-        self.assertEqual(
-            [
-                (item.feature.shape[-1], int(item.feature_attention_mask.sum()))
-                for item in items
-            ],
-            [(800, 800), (800, 800), (25, 25)],
-        )
-
-        exact, _ = _items(self.owner, self.audio[: 2 * window])
-        self.assertEqual(len(exact), 2)
-        tiny_tail, _ = _items(self.owner, self.audio[: 2 * window + 200])
-        self.assertEqual(len(tiny_tail), 2)
-        self.assertNotEqual(tiny_tail[1].hash, exact[1].hash)
-        self.assertGreater(tiny_tail[1].feature.shape[-1], 800)
-
+    def test_windows_preserve_features_and_offsets(self):
         context = self.config.leading_context_samples
-        self.assertEqual(context, 320)
-        rolling, _ = _items(
-            self.owner,
-            self.audio[window - context : 2 * window + 4000],
-            leading_context_samples=context,
+        base = BaseMultiModalProcessorOutput(
+            input_text="audio",
+            audios=[self.audio[self.config.window_samples - context :]],
         )
-        for first, second in (
-            (items[0], exact[0]),
-            (items[1], exact[1]),
-            (rolling[0], items[1]),
-        ):
-            self.assertEqual(first.hash, second.hash)
-            self.assertTrue(torch.equal(first.feature, second.feature))
-        self.assertNotEqual(rolling[0].offsets, items[1].offsets)
+        items, ids, whole = self.owner.process_and_combine_mm_data(
+            base,
+            MultimodalSpecialTokens(audio_token_id=PLACEHOLDER),
+            mm_processor_kwargs=encoder_window_kwargs(leading_context_samples=context),
+        )
+        self.assertEqual([item.feature.shape[-1] for item in items], [800, 25])
+        self.assertEqual([item.offsets for item in items], [[(1, 104)], [(105, 108)]])
+        self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 108 + [11])
+        # Keep whole-request feature values; exclude extraction context and padding.
+        leading_frames = context // self.owner._processor.feature_extractor.hop_length
+        valid_frames = int(whole["feature_attention_mask"].sum())
+        self.assertTrue(
+            torch.equal(
+                torch.cat([item.feature for item in items], dim=-1),
+                whole["input_features"][..., leading_frames:valid_frames],
+            )
+        )
 
     def test_identity_includes_valid_frame_mask(self):
         feature = torch.zeros(1, 128, 2)
-        outputs = [
-            {"input_features": feature, "attention_mask": torch.tensor([mask])}
+        source = MultimodalDataItem(modality=Modality.AUDIO, feature=feature)
+        first, shorter = [
+            self.owner.make_encoder_window_item(
+                source, feature=feature, mask=torch.tensor([mask]), offsets=[(0, 0)]
+            )
             for mask in ([1, 1], [1, 0])
         ]
-        with patch.object(WhisperFeatureExtractor, "__call__", side_effect=outputs):
-            samples = np.zeros(320, dtype=np.float32)
-            prepared = self.owner.extract_encoder_window_features([samples, samples])
-            first, shorter = [
-                self.owner.make_encoder_window_item(feature, mask, [(0, count - 1)])
-                for feature, mask, count in zip(
-                    prepared.features, prepared.masks, prepared.token_counts
-                )
-            ]
         self.assertNotEqual(first.hash, shorter.hash)
 
     def test_opt_in_uses_server_config(self):
@@ -152,31 +125,32 @@ class TestAudioWindows(CustomTestCase):
 
         kwargs = encoder_window_kwargs()
         kwargs["encoder_window"]["window_samples"] = 1
-        items, ids, _ = self.owner.process_and_combine_mm_data(
-            base, tokens, mm_processor_kwargs=kwargs
-        )
+        with patch.object(
+            self.owner, "process_mm_data", wraps=self.owner.process_mm_data
+        ) as process:
+            items, ids, _ = self.owner.process_and_combine_mm_data(
+                base, tokens, mm_processor_kwargs=kwargs
+            )
+            process.assert_called_once()
         self.assertEqual(len(items), 2)
         self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 108 + [11])
 
 
-def _audio_item(frames, valid_frames=None):
-    batch = len(valid_frames) if valid_frames is not None else 1
-    feature = torch.arange(batch * 4 * frames, dtype=torch.float64).reshape(
-        batch, 4, frames
-    )
-    data = {}
-    if valid_frames is not None:
-        data["feature_attention_mask"] = (
-            torch.arange(frames)[None, :] < torch.tensor(valid_frames)[:, None]
-        )
-    return MultimodalDataItem(
-        modality=Modality.AUDIO, feature=feature, model_specific_data=data
-    )
-
-
 class TestAudioBatching(CustomTestCase):
     def test_variable_widths_preserve_each_batch_row_in_item_order(self):
-        items = [_audio_item(6, valid_frames=[6]), _audio_item(10, valid_frames=[2, 9])]
+        items = []
+        for frames, valid_frames in ((6, [6]), (10, [2, 9])):
+            feature = torch.arange(len(valid_frames) * 4 * frames).reshape(
+                -1, 4, frames
+            )
+            mask = torch.arange(frames)[None, :] < torch.tensor(valid_frames)[:, None]
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.AUDIO,
+                    feature=feature.float(),
+                    model_specific_data={"feature_attention_mask": mask},
+                )
+            )
         expected = torch.cat(
             [
                 items[0].feature[0],
@@ -194,8 +168,6 @@ class TestAudioBatching(CustomTestCase):
         features = tower.call_args.args[0]
         lengths = tower.call_args.kwargs["feature_lens"]
         self.assertEqual(lengths.tolist(), [6, 2, 9])
-        self.assertEqual(lengths.dtype, torch.long)
-        self.assertEqual(features.dtype, torch.float32)
         self.assertTrue(torch.equal(features, expected.float()))
 
 

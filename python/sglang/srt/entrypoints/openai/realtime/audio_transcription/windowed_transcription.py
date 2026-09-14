@@ -104,8 +104,17 @@ class EncoderWindowMode(TranscriptionMode):
     ) -> None:
         super().__init__(tokenizer_manager, adapter, routed_dp_rank=routed_dp_rank)
         self.encoder_window = encoder_window
-        self.chunk_size_bytes = chunk_size_bytes
         self.activation_threshold_bytes = activation_threshold_bytes
+        window_bytes = encoder_window.window_bytes
+        # Allow one extra window to resolve a stall, including a first
+        # handoff whose activation threshold exceeds the rolling context.
+        self._max_retained_bytes = (
+            max(
+                (encoder_window.policy.max_audio_context_windows + 1) * window_bytes,
+                activation_threshold_bytes + chunk_size_bytes,
+            )
+            + window_bytes
+        )
 
     def can_activate(
         self,
@@ -198,16 +207,7 @@ class EncoderWindowMode(TranscriptionMode):
         start = max(floor, min(start, floor + window_bytes))
         if current.unconfirmed_start is not None:
             start = min(start, current.unconfirmed_start)
-        # Allow one extra window to resolve a stall, including a first
-        # handoff whose activation threshold exceeds the rolling context.
-        max_retained = (
-            max(
-                (context_windows + 1) * window_bytes,
-                self.activation_threshold_bytes + self.chunk_size_bytes,
-            )
-            + window_bytes
-        )
-        if end_offset_bytes - start > max_retained:
+        if end_offset_bytes - start > self._max_retained_bytes:
             raise RuntimeError(
                 "realtime ASR transcript did not advance within the retained audio limit"
             )
@@ -243,8 +243,10 @@ class EncoderWindowMode(TranscriptionMode):
                 return
             # Preserve a leading continuation space after confirmed holdback.
             snapshot = text[: text.rfind(units[-1])].rstrip()
-            candidate = self._reconcile_encoder_window_text(
-                step, suffix_before, snapshot
+            candidate = suffix_before.reconcile(
+                snapshot,
+                is_last=step.is_last,
+                holdback_units=self.encoder_window.policy.decoder_prefix_holdback_units,
             ).delta
             await on_candidate(candidate)
 
@@ -401,10 +403,6 @@ def resolve_realtime_encoder_window_policy(
     tokenizer = tokenizer_manager.tokenizer
     max_buffer_seconds = serving_config.asr_max_buffer_seconds
     dp_size = tokenizer_manager.elastic_worker_count
-    min_audio_sec = serving_config.asr_encoder_window_min_audio_seconds
-    max_audio_context_windows = serving_config.asr_encoder_window_max_context_windows
-    decoder_prefix_max_tokens = serving_config.asr_decoder_prefix_max_tokens
-    decoder_prefix_holdback_units = serving_config.asr_decoder_prefix_holdback_units
 
     policy = adapter.realtime_encoder_window_policy
     if policy is None or not isinstance(mm_processor, EncoderWindowCapability):
@@ -418,17 +416,15 @@ def resolve_realtime_encoder_window_policy(
         raise TypeError(
             "realtime_encoder_window_policy must return RealtimeEncoderWindowPolicy"
         )
-    overrides = {}
-    if min_audio_sec is not None:
-        overrides["min_audio_sec"] = min_audio_sec
-    if max_audio_context_windows is not None:
-        overrides["max_audio_context_windows"] = max_audio_context_windows
-    if decoder_prefix_max_tokens is not None:
-        overrides["decoder_prefix_max_tokens"] = decoder_prefix_max_tokens
-    if decoder_prefix_holdback_units is not None:
-        overrides["decoder_prefix_holdback_units"] = decoder_prefix_holdback_units
+    overrides = {
+        "min_audio_sec": serving_config.asr_encoder_window_min_audio_seconds,
+        "max_audio_context_windows": serving_config.asr_encoder_window_max_context_windows,
+        "decoder_prefix_max_tokens": serving_config.asr_decoder_prefix_max_tokens,
+        "decoder_prefix_holdback_units": serving_config.asr_decoder_prefix_holdback_units,
+    }
+    overrides = {name: value for name, value in overrides.items() if value is not None}
     if overrides:
-        policy = msgspec.structs.replace(policy, **overrides)
+        policy = replace(policy, **overrides)
     if tokenizer is None:
         raise RuntimeError(
             "encoder-window ASR requires a tokenizer for the decoder prefix"
