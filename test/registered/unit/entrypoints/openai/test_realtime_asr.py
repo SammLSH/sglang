@@ -149,7 +149,7 @@ def _append(connection, pcm):
     )
 
 
-def _activate(connection, pending="four five six"):
+def _activate(connection, pending=" four five six"):
     connection.transcription_state.emitted_text = "one two three"
     connection.transcription_state.mode_state = WindowedState(
         suffix=TranscriptionSuffixState(pending=pending)
@@ -199,9 +199,9 @@ class TestRealtimeASR(CustomTestCase):
         manager, connection = _connection(
             [
                 ["one two three four"],
-                ["four five six"],
-                ["four five six seven"],
-                ["six seven eight nine"],
+                [" four five six"],
+                [" four five six seven"],
+                [" six seven eight nine"],
             ],
             window=True,
             threshold=60,
@@ -291,6 +291,15 @@ class TestRealtimeASR(CustomTestCase):
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
         self.assertEqual(_transcript(connection), (expected, [expected]))
 
+        scripts = [["你好API接口"], ["你好API接口"], ["继续输出"], ["继续输出"]]
+        manager, connection = _connection(scripts, window=True, streaming=True)
+        for _ in scripts:
+            self.assertFalse(_append(connection, bytes(4)))
+        self.assertEqual(manager.requests[-1].text, "PROMPT:你好API接口")
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        expected = "你好API接口继续输出"
+        self.assertEqual(_transcript(connection), (expected, [expected]))
+
     def test_failed_send_records_only_successfully_published_text(self):
         _, connection = _connection(
             [["one two three", "one two three four"]], streaming=True
@@ -340,12 +349,12 @@ class TestRealtimeASR(CustomTestCase):
         manager, connection = _connection(
             [
                 [("truncated words", {"type": "length"})],
-                ["one two three four", "one two three four five six"],
+                [" one two three four", " one two three four five six"],
             ],
             window=True,
             streaming=True,
         )
-        _activate(connection, pending="one two three four five")
+        _activate(connection, pending=" one two three four five")
         state = connection.transcription_state
         original_pcm = np.array([1, 2], dtype=np.int16).tobytes()
         state.audio.append_pcm(original_pcm)
@@ -356,7 +365,7 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(state.audio.last_processed_offset_bytes, 0)
         self.assertEqual(bytes(state.audio.data), original_pcm)
         self.assertEqual(state.emitted_text, "one two three")
-        self.assertEqual(state.mode_state.suffix.pending, "one two three four five")
+        self.assertEqual(state.mode_state.suffix.pending, " one two three four five")
 
         state.audio.append_pcm(np.array([3, 4], dtype=np.int16).tobytes())
         delta = _step(connection)

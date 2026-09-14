@@ -8,7 +8,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_su
     SuffixUpdate,
     TranscriptionSuffixState,
 )
-from sglang.srt.entrypoints.openai.streaming_asr import join_text
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,15 +22,20 @@ def _pending_state(update):
 
 class TestTranscriptionSuffixState(CustomTestCase):
     def test_agreement_and_final_pending(self):
-        state = TranscriptionSuffixState(pending="two three four")
-        update = state.reconcile("two three five", is_last=False, holdback_units=1)
-        self.assertEqual(update, SuffixUpdate(delta="two", pending="three five"))
-        self.assertEqual(state.pending, "two three four")
-        state = _pending_state(update)
-        update = state.reconcile("", is_last=True, holdback_units=1)
-        self.assertEqual(update, SuffixUpdate(delta="three five", pending=""))
-        state = _pending_state(update)
-        self.assertEqual(state.flush(), "")
+        for pending, candidate, delta, tail in (
+            ("two three four", "two three five", "two", " three five"),
+            ("你好API接口", "你好API结果", "你好", "API结果"),
+        ):
+            with self.subTest(candidate=candidate):
+                state = TranscriptionSuffixState(pending=pending)
+                update = state.reconcile(candidate, is_last=False, holdback_units=1)
+                self.assertEqual(update, SuffixUpdate(delta=delta, pending=tail))
+                self.assertEqual(update.delta + update.pending, candidate)
+                self.assertEqual(state.pending, pending)
+                state = _pending_state(update)
+                update = state.reconcile("", is_last=True, holdback_units=1)
+                self.assertEqual(update, SuffixUpdate(delta=tail, pending=""))
+                self.assertEqual(_pending_state(update).flush(), "")
 
     def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(self):
         tokenizer = SimpleNamespace(
@@ -58,21 +62,21 @@ class TestTranscriptionSuffixState(CustomTestCase):
                 self.assertEqual(state.pending, expected)
                 update = state.reconcile(continuation, is_last=False, holdback_units=1)
                 state = _pending_state(update)
-                self.assertEqual(join_text(update.delta, state.flush()), expected)
+                self.assertEqual(update.delta + state.flush(), expected)
                 self.assertEqual(state.confirmed_pending_chars, 0)
         state = TranscriptionSuffixState(pending="very very")
         update = state.reconcile("very very", is_last=False, holdback_units=1)
         self.assertEqual(update.delta, "very")
         state = _pending_state(update)
-        self.assertEqual(state.flush(), "very")
+        self.assertEqual(state.flush(), " very")
 
     def test_final_delta_and_flush_preserve_punctuation(self):
         update = TranscriptionSuffixState().reconcile(
             ",  world", is_last=True, holdback_units=1
         )
-        self.assertEqual(update.delta, ", world")
+        self.assertEqual(update.delta, ",  world")
         state = TranscriptionSuffixState(pending=" ,  again")
-        self.assertEqual(state.flush(), ", again")
+        self.assertEqual(state.flush(), " ,  again")
         self.assertEqual(state.pending, "")
         self.assertEqual(state.flush(), "")
 
@@ -112,6 +116,10 @@ class TestTranscriptionSuffixState(CustomTestCase):
                     state.bounded_prefix(tokenizer, budget, emitted_text=source),
                     expected,
                 )
+        state = TranscriptionSuffixState(pending="API接口", confirmed_pending_chars=3)
+        self.assertEqual(
+            state.bounded_prefix(char_tokenizer, 20, emitted_text="你好"), "你好API"
+        )
 
 
 if __name__ == "__main__":

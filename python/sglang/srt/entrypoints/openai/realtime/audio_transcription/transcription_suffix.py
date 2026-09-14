@@ -14,8 +14,7 @@ import msgspec
 from sglang.srt.entrypoints.openai.streaming_asr import (
     _is_cjk,
     common_unit_prefix,
-    join_text,
-    join_units,
+    iter_unit_spans,
     split_units,
 )
 
@@ -27,6 +26,7 @@ _MAX_CHARS_PER_TOKEN = 64
 class SuffixUpdate(msgspec.Struct, frozen=True):
     """One reconcile result, applied only after its request is accepted."""
 
+    # Exact append to the step's published text, including boundary whitespace.
     delta: str
     pending: str
     # Character prefix of pending confirmed by agreement but held from publication.
@@ -62,7 +62,8 @@ class TranscriptionSuffixState(msgspec.Struct):
     Published text is supplied by the caller when building decoder context.
     """
 
-    # Unpublished text; its confirmed prefix is also supplied to the decoder.
+    # Exact unpublished suffix, including any separator after published text.
+    # Its confirmed prefix is also supplied to the decoder.
     pending: str = ""
     confirmed_pending_chars: int = 0
 
@@ -73,7 +74,7 @@ class TranscriptionSuffixState(msgspec.Struct):
     def bounded_prefix(self, tokenizer, max_tokens: int, *, emitted_text: str) -> str:
         """The most recent confirmed text, at most ``max_tokens`` tokens long,
         starting on a unit boundary."""
-        source = join_text(emitted_text, self.confirmed_pending)
+        source = emitted_text + self.confirmed_pending
         if not source or max_tokens <= 0:
             return ""
         tail = source[-max_tokens * _MAX_CHARS_PER_TOKEN :]
@@ -101,10 +102,10 @@ class TranscriptionSuffixState(msgspec.Struct):
         is_last: bool,
         holdback_units: int,
     ) -> SuffixUpdate:
-        """Compute the publishable delta for one decode without mutating."""
+        """Compare text units, then slice exact delta and pending text without mutating."""
         if not continuation.strip():
             if is_last:
-                return SuffixUpdate(delta=join_text("", self.pending), pending="")
+                return SuffixUpdate(delta=self.pending, pending="")
             return SuffixUpdate(
                 delta="",
                 pending=self.pending,
@@ -114,34 +115,31 @@ class TranscriptionSuffixState(msgspec.Struct):
         # The decoder already received the confirmed holdback. Preserve exact
         # character continuation: "car" + "pet" differs from "car" + " pet".
         candidate = self.confirmed_pending + continuation
-        continuation_units = split_units(candidate)
         if is_last:
-            return SuffixUpdate(
-                delta=join_text("", candidate),
-                pending="",
-            )
+            return SuffixUpdate(delta=candidate, pending="")
+        spans = list(iter_unit_spans(candidate))
+        continuation_units = [candidate[start:end] for start, end in spans]
         pending_units = split_units(self.pending)
         if not pending_units:
-            return SuffixUpdate(delta="", pending=join_units(continuation_units))
+            return SuffixUpdate(delta="", pending=candidate)
         agreed = common_unit_prefix(pending_units, continuation_units, normalized=True)
         emit = max(0, agreed - holdback_units)
-        pending = join_units(continuation_units[emit:])
+        # Leave the separator after the last emitted unit with the pending tail.
+        pending_start = spans[emit - 1][1] if emit else 0
         # Keep an accepted character prefix even when new audio extends its
         # final word; that word still needs agreement before publication.
-        candidate_text = join_units(continuation_units)
         confirmed_end = self.confirmed_pending_chars
         if pending_units == continuation_units:
-            confirmed_end = len(candidate_text)
-        pending_start = len(candidate_text) - len(pending)
+            confirmed_end = len(candidate)
         return SuffixUpdate(
-            delta=join_text("", join_units(continuation_units[:emit])),
-            pending=pending,
+            delta=candidate[:pending_start],
+            pending=candidate[pending_start:],
             confirmed_pending_chars=max(0, confirmed_end - pending_start),
         )
 
     def flush(self) -> str:
         """Release the pending tail for the caller to publish."""
-        delta = join_text("", self.pending)
+        delta = self.pending
         self.pending = ""
         self.confirmed_pending_chars = 0
         return delta
