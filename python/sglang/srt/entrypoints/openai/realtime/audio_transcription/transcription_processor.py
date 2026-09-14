@@ -33,8 +33,8 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcr
     EncoderWindowMode,
     ResolvedEncoderWindowPolicy,
 )
-from sglang.srt.entrypoints.openai.streaming_transcription import (
-    CumulativeTranscriptState,
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
     join_text,
     normalize_whitespace,
 )
@@ -108,7 +108,7 @@ class RealtimeTranscriptionProcessor:
         return RealtimeTranscriptionState(
             audio=AudioBuffer(),
             mode_state=CumulativeState(
-                transcript=CumulativeTranscriptState(**self._chunked_streaming_config)
+                transcript=StreamingASRState(**self._chunked_streaming_config)
             ),
         )
 

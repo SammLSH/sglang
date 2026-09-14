@@ -29,8 +29,8 @@ _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 
 @dataclass
-class CumulativeTranscriptState:
-    """Cumulative transcript candidates with prefix rollback.
+class StreamingASRState:
+    """State for chunk-based streaming ASR with prefix rollback.
 
     Published text belongs to the caller and is supplied to each operation.
     Updating a candidate never records publication.
@@ -78,7 +78,11 @@ class CumulativeTranscriptState:
         # re-emitting already-sent content and cutting mid-word.
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
-        common_count = common_unit_prefix(old_words, new_words)
+        common_count = 0
+        for ow, nw in zip(old_words, new_words):
+            if ow != nw:
+                break
+            common_count += 1
         return join_text("", " ".join(new_words[common_count:]))
 
     def unpublished_text(self, *, emitted_text: str, split_cjk: bool = False) -> str:
@@ -152,7 +156,7 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-def is_cjk_char(c: str) -> bool:
+def _is_cjk(c: str) -> bool:
     """Whether char is a CJK-context glyph that doesn't take inter-word
     spaces — ideographs, Japanese kana, CJK punctuation, fullwidth forms.
     Excludes Hangul / Devanagari / Arabic etc., which are non-ASCII but
@@ -180,22 +184,22 @@ def needs_space(prev: str, cur: str) -> bool:
         return False
     if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
         return False
-    if is_cjk_char(prev[-1]) and is_cjk_char(cur[0]):
+    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
         return False
     return True
 
 
-async def process_transcription_chunk(
+async def process_asr_chunk(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
-    state: CumulativeTranscriptState,
+    state: StreamingASRState,
     audio_data: bytes,
     sampling_params: Dict[str, Any],
     is_last: bool,
-    *,
-    emitted_text: str,
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
+    *,
+    emitted_text: str,
 ) -> str:
     """Update a caller-owned candidate for one HTTP streaming chunk.
 
@@ -230,7 +234,7 @@ def split_units(text: str) -> List[str]:
     for token in text.split():
         run: List[str] = []
         for char in token:
-            if is_cjk_char(char):
+            if _is_cjk(char):
                 if run:
                     units.append("".join(run))
                     run = []
@@ -244,8 +248,8 @@ def split_units(text: str) -> List[str]:
 
 def _space_between(prev: str, cur: str) -> bool:
     prev_char, cur_char = prev[-1], cur[0]
-    prev_script = is_cjk_char(prev_char)
-    cur_script = is_cjk_char(cur_char)
+    prev_script = _is_cjk(prev_char)
+    cur_script = _is_cjk(cur_char)
     if not prev_script and not cur_script:
         # Plain whitespace-delimited text: always one space, like " ".join.
         return True
@@ -428,7 +432,7 @@ def _raise_for_aborted_response(response: Dict[str, Any]) -> None:
 
 
 def apply_cumulative_transcript(
-    state: CumulativeTranscriptState, text: str, *, is_last: bool, emitted_text: str
+    state: StreamingASRState, text: str, *, is_last: bool, emitted_text: str
 ) -> str:
     """Apply a cumulative hypothesis to the shared rollback state."""
     if is_last:

@@ -8,7 +8,7 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_su
     SuffixUpdate,
     TranscriptionSuffixState,
 )
-from sglang.srt.entrypoints.openai.streaming_transcription import join_text
+from sglang.srt.entrypoints.openai.streaming_asr import join_text
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

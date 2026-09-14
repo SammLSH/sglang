@@ -21,7 +21,7 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_st
     CumulativeState,
     RealtimeTranscriptionState,
 )
-from sglang.srt.entrypoints.openai.streaming_transcription import (
+from sglang.srt.entrypoints.openai.streaming_asr import (
     apply_cumulative_transcript,
     generate_transcript,
 )

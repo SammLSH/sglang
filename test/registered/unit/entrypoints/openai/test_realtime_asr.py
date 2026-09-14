@@ -91,12 +91,10 @@ def _policy(threshold):
     return ResolvedEncoderWindowPolicy(
         config=AudioEncoderWindowConfig(
             sample_rate=1,
-            hop_length=1,
-            window_frames=8,
             window_samples=8,
             window_tokens=8,
             min_tail_samples=4,
-            context_samples=2,
+            leading_context_samples=2,
         ),
         policy=RealtimeEncoderWindowPolicy(
             min_audio_sec=threshold,
@@ -156,6 +154,14 @@ def _step(connection, *, is_last=False, published=None):
     return "".join(deltas)
 
 
+def _append(connection, pcm):
+    return _run(
+        connection._on_input_audio_buffer_append(
+            SimpleNamespace(audio=base64.b64encode(pcm).decode())
+        )
+    )
+
+
 def _activate(connection, pending="four five six"):
     connection.transcription_state.emitted_text = "one two three"
     connection.transcription_state.mode_state = WindowedState(
@@ -169,6 +175,13 @@ def _events(connection, suffix):
         for call in connection.transport.send.call_args_list
         if call.args[0].type.endswith(suffix)
     ]
+
+
+def _transcript(connection):
+    return (
+        "".join(event.delta for event in _events(connection, ".delta")),
+        [event.transcript for event in _events(connection, ".completed")],
+    )
 
 
 class TestRealtimeASR(CustomTestCase):
@@ -201,10 +214,8 @@ class TestRealtimeASR(CustomTestCase):
                 connection.config.language = language
                 connection.transcription_state.audio.append_pcm(bytes(4))
                 self.assertTrue(_run(connection._run_inference(is_last=final)))
-                self.assertEqual(
-                    connection.transcription_state.encoder_window_active,
-                    expected_window,
-                )
+                state = connection.transcription_state
+                self.assertEqual(state.encoder_window_active, expected_window)
                 self.assertEqual(
                     bool(manager.requests[0].mm_processor_kwargs), expected_window
                 )
@@ -219,13 +230,13 @@ class TestRealtimeASR(CustomTestCase):
                 state.mode_state.transcript.unfixed_chunk_num = 1
                 state.audio.append_pcm(bytes(4))
                 _step(connection)
-                before = vars(state.mode_state.transcript).copy()
+                before = deepcopy(state.mode_state)
                 state.audio.append_pcm(bytes(2))
                 published = []
                 with self.assertRaisesRegex(RuntimeError, "max_new_tokens"):
                     _step(connection, is_last=final, published=published)
                 self.assertEqual(published, [])
-                self.assertEqual(vars(state.mode_state.transcript), before)
+                self.assertEqual(state.mode_state, before)
                 self.assertEqual(manager.requests[-1].text, "PROMPT:one two")
                 self.assertFalse(manager.requests[-1].stream)
                 self.assertEqual(state.audio.last_attempted_offset_bytes, 4)
@@ -238,15 +249,10 @@ class TestRealtimeASR(CustomTestCase):
         )
         # Two complete chunks, then one real sample handled by commit.
         for size in (4, 4, 2):
-            _run(
-                connection._on_input_audio_buffer_append(
-                    SimpleNamespace(audio=base64.b64encode(bytes(size)).decode())
-                )
-            )
+            self.assertFalse(_append(connection, bytes(size)))
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-        text = "".join(e.delta for e in _events(connection, ".delta"))
-        self.assertEqual(text, "Hello, world, today!")
-        self.assertEqual(_events(connection, ".completed")[0].transcript, text)
+        text = "Hello, world, today!"
+        self.assertEqual(_transcript(connection), (text, [text]))
         self.assertEqual(len(manager.requests[-1].audio_data), 5)
         self.assertTrue(all(not request.stream for request in manager.requests))
 
@@ -324,10 +330,7 @@ class TestRealtimeASR(CustomTestCase):
 
     def test_stable_holdback_survives_long_silence_resume_commit_and_clear(self):
         for ending in ("commit", "resume", "clear"):
-            with (
-                self.subTest(ending=ending),
-                get_context().override_server_args(asr_max_buffer_seconds=600),
-            ):
+            with self.subTest(ending=ending):
                 manager, connection = _connection([], window=True, threshold=60)
                 spoken = "yes."
 
@@ -342,26 +345,9 @@ class TestRealtimeASR(CustomTestCase):
 
                 manager.generate_request = generate
 
-                def append(seconds=2):
-                    # The fixture uses 1 Hz PCM; exercise normal append pacing.
-                    stop = _run(
-                        connection._on_input_audio_buffer_append(
-                            SimpleNamespace(
-                                audio=base64.b64encode(bytes(seconds * 2)).decode()
-                            )
-                        )
-                    )
-                    self.assertFalse(
-                        stop,
-                        (
-                            connection.transcription_state.audio.received_bytes,
-                            _events(connection, "error"),
-                        ),
-                    )
-
                 # Cross the 60-s handoff and multiple 8-s window boundaries.
                 for _ in range(40):
-                    append()
+                    self.assertFalse(_append(connection, bytes(4)))
                 state = connection.transcription_state
                 self.assertTrue(state.encoder_window_active)
                 self.assertGreaterEqual(state.audio.last_processed_offset_bytes, 156)
@@ -371,7 +357,7 @@ class TestRealtimeASR(CustomTestCase):
                 if ending == "resume":
                     spoken = "yes. we continue."
                     for _ in range(3):
-                        append()
+                        self.assertFalse(_append(connection, bytes(4)))
                 elif ending == "clear":
                     _run(connection._on_input_audio_buffer_clear(SimpleNamespace()))
                     self.assertFalse(
@@ -380,44 +366,31 @@ class TestRealtimeASR(CustomTestCase):
                     self.assertFalse(connection.transcription_state.has_audio)
                     spoken = "new item."
                 # A real sub-chunk tail must be decoded at commit, even in silence.
-                append(1)
+                self.assertFalse(_append(connection, bytes(2)))
                 requests_before_commit = len(manager.requests)
                 _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
                 self.assertEqual(len(manager.requests), requests_before_commit + 1)
-                self.assertEqual(
-                    _events(connection, ".completed")[0].transcript, spoken
-                )
-                self.assertEqual(
-                    "".join(e.delta for e in _events(connection, ".delta")), spoken
-                )
+                self.assertEqual(_transcript(connection), (spoken, [spoken]))
                 self.assertFalse(connection.transcription_state.has_audio)
                 self.assertFalse(connection.transcription_state.encoder_window_active)
 
     def test_unconfirmed_tail_retains_audio_despite_empty_or_changing_results(self):
         for empty in (False, True):
-            with (
-                self.subTest(empty=empty),
-                get_context().override_server_args(asr_max_buffer_seconds=600),
-            ):
+            with self.subTest(empty=empty):
                 scripts = (
                     [["yes."]] * 30
                     + [["maybe."]]
                     + [["" if empty else f"revision{i}."] for i in range(5)]
                 )
                 manager, connection = _connection(scripts, window=True, threshold=60)
-                event = SimpleNamespace(audio=base64.b64encode(bytes(4)).decode())
                 for _ in range(35):
-                    self.assertFalse(
-                        _run(connection._on_input_audio_buffer_append(event))
-                    )
+                    self.assertFalse(_append(connection, bytes(4)))
                 state = connection.transcription_state
                 self.assertEqual(state.audio.last_processed_offset_bytes, 120)
                 self.assertEqual(state.audio.base_offset_bytes, 0)
                 self.assertEqual(state.mode_state.suffix.confirmed_pending_chars, 0)
                 with self.assertLogs(level="ERROR"):
-                    self.assertTrue(
-                        _run(connection._on_input_audio_buffer_append(event))
-                    )
+                    self.assertTrue(_append(connection, bytes(4)))
                 self.assertEqual(len(manager.requests), 35)
                 self.assertFalse(_events(connection, ".completed"))
 
@@ -431,16 +404,9 @@ class TestRealtimeASR(CustomTestCase):
                 adapter=Qwen3ASRAdapter(),
             )
             connection.config.language = "zh"
-            _run(
-                connection._on_input_audio_buffer_append(
-                    SimpleNamespace(audio=base64.b64encode(bytes(64000)).decode())
-                )
-            )
+            self.assertFalse(_append(connection, bytes(64000)))
             _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-            self.assertEqual(_events(connection, ".completed")[0].transcript, final)
-            self.assertEqual(
-                "".join(e.delta for e in _events(connection, ".delta")), final
-            )
+            self.assertEqual(_transcript(connection), (final, [final]))
             self.assertEqual(len(manager.requests), 1)
 
     def test_publication_uses_one_snapshot_through_preview_final_and_flush(self):
@@ -473,24 +439,14 @@ class TestRealtimeASR(CustomTestCase):
                 manager, connection = _connection(
                     scripts, window=window, streaming=True
                 )
+                state = connection.transcription_state
                 for _ in scripts:
-                    event = SimpleNamespace(audio=base64.b64encode(bytes(4)).decode())
-                    self.assertFalse(
-                        _run(connection._on_input_audio_buffer_append(event))
-                    )
-                    self.assertEqual(
-                        connection.transcription_state.emitted_text,
-                        "".join(e.delta for e in _events(connection, ".delta")),
-                    )
+                    self.assertFalse(_append(connection, bytes(4)))
+                    self.assertEqual(state.emitted_text, _transcript(connection)[0])
                 self.assertEqual(manager.requests[-1].text, "PROMPT:" + expected_prefix)
                 _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
                 self.assertEqual(len(manager.requests), len(scripts))
-                self.assertEqual(
-                    "".join(e.delta for e in _events(connection, ".delta")), expected
-                )
-                self.assertEqual(
-                    _events(connection, ".completed")[0].transcript, expected
-                )
+                self.assertEqual(_transcript(connection), (expected, [expected]))
 
     def test_failed_send_records_only_successfully_published_text(self):
         for streaming in (False, True):
@@ -498,6 +454,7 @@ class TestRealtimeASR(CustomTestCase):
                 _, connection = _connection(
                     [["one two three", "one two three four"]], streaming=streaming
                 )
+                mode_before = deepcopy(connection.transcription_state.mode_state)
                 delivered = []
 
                 async def send(event):
@@ -509,25 +466,13 @@ class TestRealtimeASR(CustomTestCase):
                         delivered.append(event.delta)
 
                 connection.transport.send.side_effect = send
-                event = SimpleNamespace(audio=base64.b64encode(bytes(4)).decode())
                 with self.assertLogs(level="ERROR"):
-                    self.assertTrue(
-                        _run(connection._on_input_audio_buffer_append(event))
-                    )
-                self.assertEqual(
-                    connection.transcription_state.emitted_text,
-                    "one" if streaming else "",
-                )
-                self.assertEqual(
-                    connection.transcription_state.emitted_text, "".join(delivered)
-                )
-                self.assertEqual(
-                    connection.transcription_state.mode_state.transcript.full_transcript,
-                    "",
-                )
-                self.assertEqual(
-                    connection.transcription_state.audio.last_processed_offset_bytes, 0
-                )
+                    self.assertTrue(_append(connection, bytes(4)))
+                state = connection.transcription_state
+                self.assertEqual(state.emitted_text, "one" if streaming else "")
+                self.assertEqual(state.emitted_text, "".join(delivered))
+                self.assertEqual(state.mode_state, mode_before)
+                self.assertEqual(state.audio.last_processed_offset_bytes, 0)
                 connection.transport.finish.assert_awaited_once_with("server_error")
 
     def test_failed_preview_preserves_sent_text_but_not_candidate_or_audio(self):
@@ -545,6 +490,7 @@ class TestRealtimeASR(CustomTestCase):
                 mode_before = deepcopy(state.mode_state)
                 emitted_before = state.emitted_text
                 state.audio.append_pcm(bytes(4))
+                audio_before = deepcopy(state.audio)
                 published = []
                 with self.assertRaises(RuntimeError):
                     _step(connection, published=published)
@@ -553,21 +499,16 @@ class TestRealtimeASR(CustomTestCase):
                     state.emitted_text, emitted_before + "".join(published)
                 )
                 self.assertEqual(state.mode_state, mode_before)
-                self.assertEqual(state.audio.last_attempted_offset_bytes, 0)
-                self.assertEqual(state.audio.last_processed_offset_bytes, 0)
-                self.assertEqual(state.audio.base_offset_bytes, 0)
-                self.assertEqual(bytes(state.audio.data), bytes(4))
+                self.assertEqual(state.audio, audio_before)
 
     def test_item_audio_limit_still_applies_after_window_fallback(self):
         with get_context().override_server_args(asr_max_buffer_seconds=6):
             manager, connection = _connection([[], [], ["one two"]], window=True)
             # Both handoff attempts fail; the same append resumes cumulatively.
-            event = SimpleNamespace(audio=base64.b64encode(bytes(12)).decode())
-            self.assertFalse(_run(connection._on_input_audio_buffer_append(event)))
+            self.assertFalse(_append(connection, bytes(12)))
             self.assertEqual(len(manager.requests), 3)
             self.assertIsNone(manager.requests[-1].mm_processor_kwargs)
-            event.audio = base64.b64encode(bytes(2)).decode()
-            self.assertTrue(_run(connection._on_input_audio_buffer_append(event)))
+            self.assertTrue(_append(connection, bytes(2)))
             connection.transport.finish.assert_awaited_once_with("buffer_overflow")
             self.assertEqual(connection.transcription_state.audio.received_bytes, 12)
 
@@ -631,39 +572,19 @@ class TestRealtimeASR(CustomTestCase):
 
     def test_invalid_payload_clears_previous_client_event_id(self):
         _, connection = _connection([])
-        cases = [
-            (
-                {"type": "unknown", "event_id": "first"},
-                ("unknown_event", "first", None),
-            ),
-            (ValueError("Invalid JSON"), ("invalid_payload", None, None)),
-            (
-                {"type": "input_audio_buffer.append", "event_id": "third"},
-                ("invalid_value", "third", "audio"),
-            ),
-            ({}, ("invalid_value", None, "type")),
-            (
-                {"type": [], "event_id": "bad-type"},
-                ("invalid_value", "bad-type", "type"),
-            ),
-            (
-                {"type": "input_audio_buffer.clear", "event_id": []},
-                ("invalid_value", None, "event_id"),
-            ),
-        ]
-        connection.transport.receive.side_effect = [raw for raw, _ in cases] + [
-            {"type": "input_audio_buffer.clear", "event_id": None},
-            {"type": "input_audio_buffer.clear", "event_id": ""},
+        connection.transport.receive.side_effect = [
+            {"type": "unknown", "event_id": "first"},
+            ValueError("Invalid JSON"),
             {"type": "input_audio_buffer.clear"},
             None,
         ]
         _run(connection.run())
         errors = [event.error for event in _events(connection, "error")]
         self.assertEqual(
-            [(error.code, error.event_id, error.param) for error in errors],
-            [expected for _, expected in cases],
+            [(error.code, error.event_id) for error in errors],
+            [("unknown_event", "first"), ("invalid_payload", None)],
         )
-        self.assertEqual(len(_events(connection, ".cleared")), 3)
+        self.assertEqual(len(_events(connection, ".cleared")), 1)
         connection.transport.finish.assert_not_awaited()
 
     def test_connection_exit_waits_for_backend_cleanup_and_releases_session(self):

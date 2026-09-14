@@ -24,7 +24,6 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.multimodal.encoder_window import (
     build_audio_window_items,
     build_audio_window_processor_kwargs,
-    resolve_audio_window_config,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -119,12 +118,12 @@ class TestAudioWindows(CustomTestCase):
         owner.audio_config = {"pad_to_multiple_of": 512}
         # Standalone extraction passes; only the leading-context probe catches
         # padding that changes a rolling window's width.
-        standalone = owner.extract_audio_window_features(
-            [np.zeros(self.config.window_samples, dtype=np.float32)]
+        standalone = owner.prepare_audio_window(
+            np.zeros(self.config.window_samples, dtype=np.float32)
         )
-        self.assertEqual(standalone.features[0].shape[-1], 800)
+        self.assertEqual(standalone.item.feature.shape[-1], 800)
         with self.assertRaisesRegex(ValueError, "unpadded frames"):
-            resolve_audio_window_config(owner)
+            owner.audio_window_config()
 
     def test_shared_encoder_default_keeps_short_input_padding(self):
         config = Qwen3OmniMoeAudioEncoderConfig(
@@ -169,7 +168,7 @@ class TestAudioWindows(CustomTestCase):
         self.assertNotEqual(tiny_tail[1].hash, exact[1].hash)
         self.assertGreater(tiny_tail[1].feature.shape[-1], 800)
 
-        context = self.config.context_samples
+        context = self.config.leading_context_samples
         self.assertEqual(context, 320)
         rolling, _ = _items(
             self.owner,
@@ -187,9 +186,14 @@ class TestAudioWindows(CustomTestCase):
 
     def test_identity_includes_valid_frame_mask(self):
         feature = torch.zeros(1, 128, 2)
-        make = self.owner.make_audio_window_item
-        first = make(feature, torch.tensor([[1, 1]]), [(1, 2)])
-        shorter = make(feature, torch.tensor([[1, 0]]), [(1, 1)])
+        outputs = [
+            {"input_features": feature, "attention_mask": torch.tensor([mask])}
+            for mask in ([1, 1], [1, 0])
+        ]
+        with patch.object(_Extractor, "__call__", side_effect=outputs):
+            samples = np.zeros(320, dtype=np.float32)
+            first = self.owner.prepare_audio_window(samples).item
+            shorter = self.owner.prepare_audio_window(samples).item
         self.assertNotEqual(first.hash, shorter.hash)
 
     def test_opt_in_uses_server_config_and_a_cold_worker_clone(self):

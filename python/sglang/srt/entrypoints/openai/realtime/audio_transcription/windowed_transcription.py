@@ -33,7 +33,7 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_st
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
     TranscriptionSuffixState,
 )
-from sglang.srt.entrypoints.openai.streaming_transcription import (
+from sglang.srt.entrypoints.openai.streaming_asr import (
     TranscriptionBackendAborted,
     generate_transcript,
     split_units,
@@ -45,7 +45,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.encoder_window import (
     AudioEncoderWindowConfig,
-    WindowedAudioProcessorMixin,
+    AudioWindowProcessor,
     build_audio_window_processor_kwargs,
 )
 
@@ -71,7 +71,7 @@ class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
 
     @property
     def context_bytes(self) -> int:
-        return self.config.context_samples * PCM_SAMPLE_WIDTH_BYTES
+        return self.config.leading_context_samples * PCM_SAMPLE_WIDTH_BYTES
 
     def activation_threshold_bytes(
         self, chunk_size_bytes: int, chunk_size_sec: float
@@ -407,7 +407,7 @@ def resolve_realtime_encoder_window_policy(
     decoder_prefix_holdback_units = serving_config.asr_decoder_prefix_holdback_units
 
     policy = adapter.realtime_encoder_window_policy
-    if policy is None or not isinstance(mm_processor, WindowedAudioProcessorMixin):
+    if policy is None or not isinstance(mm_processor, AudioWindowProcessor):
         logger.warning(
             "[realtime] --enable-asr-encoder-window is set but the model or its "
             "transcription adapter does not declare encoder windowing; realtime "

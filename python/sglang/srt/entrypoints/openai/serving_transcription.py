@@ -52,10 +52,10 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcr
 )
 from sglang.srt.entrypoints.openai.realtime.transport import WebSocketRealtimeTransport
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.entrypoints.openai.streaming_transcription import (
-    CumulativeTranscriptState,
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
     needs_space,
-    process_transcription_chunk,
+    process_asr_chunk,
     split_audio_chunks,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
@@ -747,7 +747,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
-        state = CumulativeTranscriptState(**self._adapter.chunked_streaming_config)
+        state = StreamingASRState(**self._adapter.chunked_streaming_config)
         # Publication is separate from the candidate updated for each chunk.
         emitted_text = ""
 
@@ -761,7 +761,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 is_last = i == len(chunks) - 1
 
                 candidate = copy(state)
-                delta = await process_transcription_chunk(
+                delta = await process_asr_chunk(
                     tokenizer_manager=self.tokenizer_manager,
                     adapter=self._adapter,
                     state=candidate,

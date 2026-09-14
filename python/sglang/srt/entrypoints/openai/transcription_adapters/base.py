@@ -142,7 +142,7 @@ class TranscriptionAdapter(ABC):
 
     @property
     def chunked_streaming_config(self) -> dict:
-        """Parameters for ``CumulativeTranscriptState`` when using chunked streaming.
+        """Parameters for ``StreamingASRState`` when using chunked streaming.
 
         Only used when ``supports_chunked_streaming`` is True.
         Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.

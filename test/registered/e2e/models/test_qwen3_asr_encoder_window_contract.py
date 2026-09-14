@@ -25,7 +25,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.multimodal.encoder_window import (
     build_audio_window_items,
-    resolve_audio_window_config,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import load_audio
@@ -90,7 +89,7 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         cls.capability._processor = Qwen3ASRProcessor.from_pretrained(cls.snapshot)
         cls.capability.audio_config = {}
         cls.capability.hf_config = config
-        cls.window = resolve_audio_window_config(cls.capability)
+        cls.window = cls.capability.audio_window_config()
         response = requests.get(AUDIO_URL, timeout=120)
         response.raise_for_status()
         cls.audio = load_audio(response.content, sr=SAMPLE_RATE, mono=True).astype(
@@ -143,7 +142,8 @@ class TestQwen3ASREncoderWindowContract(CustomTestCase):
         for frames in (25, 37, 99, 100, 200):
             with self.subTest(tail_frames=frames):
                 samples = self.audio[
-                    : self.window.window_samples + frames * self.window.hop_length
+                    : self.window.window_samples
+                    + frames * self.capability._processor.feature_extractor.hop_length
                 ]
                 items = self._items(samples)
                 cold = self._embed(items)[self.window.window_tokens :]

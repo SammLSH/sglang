@@ -10,15 +10,15 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer imp
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
     TranscriptionSuffixState,
 )
-from sglang.srt.entrypoints.openai.streaming_transcription import (
-    CumulativeTranscriptState,
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
 )
 
 
 class CumulativeState(msgspec.Struct, frozen=True, tag="cumulative"):
     """Cumulative candidates and recovery before a window handoff commits."""
 
-    transcript: CumulativeTranscriptState
+    transcript: StreamingASRState
     window_disabled: bool = False
     handoff_failures: int = 0
     # An empty first continuation is retried without activating windowing.

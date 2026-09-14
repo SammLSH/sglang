@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import msgspec
 
-from sglang.srt.entrypoints.openai.streaming_transcription import (
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    _is_cjk,
     common_unit_prefix,
-    is_cjk_char,
     join_text,
     join_units,
     split_units,
@@ -46,8 +46,8 @@ def _align_to_unit_boundary(source: str, tail: str) -> str:
         if (
             start == 0
             or source[start - 1].isspace()
-            or is_cjk_char(source[start - 1])
-            or is_cjk_char(tail[0])
+            or _is_cjk(source[start - 1])
+            or _is_cjk(tail[0])
         ):
             return tail
     units = split_units(tail)

@@ -13,8 +13,8 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.entrypoints.openai.streaming_transcription import (
-    CumulativeTranscriptState,
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
     TranscriptionBackendAborted,
     apply_cumulative_transcript,
     generate_transcript,
@@ -28,7 +28,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestCumulativeTranscriptState(CustomTestCase):
     def test_holdback_and_revision_without_prefix(self):
-        state = CumulativeTranscriptState(2.0, 2, 1)
+        state = StreamingASRState(2.0, 2, 1)
         emitted_text = ""
         delta = state.update("one two three", emitted_text=emitted_text)
         self.assertEqual(delta, "one two")
@@ -40,7 +40,7 @@ class TestCumulativeTranscriptState(CustomTestCase):
             state.get_prefix_text(emitted_text=emitted_text), "one two three"
         )
         self.assertEqual(state.finalize(emitted_text=emitted_text), "four")
-        state = CumulativeTranscriptState(2.0, 3, 1)
+        state = StreamingASRState(2.0, 3, 1)
         emitted_text, deltas = "", []
         for text in ("a tail", "b tail", "b tail"):
             delta = state.update(text, emitted_text=emitted_text)
@@ -48,13 +48,13 @@ class TestCumulativeTranscriptState(CustomTestCase):
             emitted_text = join_text(emitted_text, delta)
         self.assertEqual(deltas, ["a", "b", ""])
         self.assertEqual(state.finalize(emitted_text=emitted_text), "tail")
-        state = CumulativeTranscriptState(2.0, 2, 5)
+        state = StreamingASRState(2.0, 2, 5)
         self.assertEqual(state.update("今天北京天气晴朗", emitted_text=""), "")
         self.assertEqual(state.update("今天上海天气晴朗", emitted_text=""), "")
         self.assertEqual(state.finalize(emitted_text=""), "今天上海天气晴朗")
 
     def test_punctuation_remainder_does_not_repeat_the_published_word(self):
-        state = CumulativeTranscriptState(2.0, 2, 1)
+        state = StreamingASRState(2.0, 2, 1)
         delta = state.update("Hello pending", emitted_text="")
         self.assertEqual(delta, "Hello")
         emitted_text = join_text("", delta)
@@ -66,7 +66,7 @@ class TestCumulativeTranscriptState(CustomTestCase):
         self.assertEqual(state.finalize(emitted_text=emitted_text), "")
 
         # A rejected mid-word extension retains the old handoff boundary.
-        state = CumulativeTranscriptState(2.0, 2, 1)
+        state = StreamingASRState(2.0, 2, 1)
         state.full_transcript = "one twofold three"
         self.assertEqual(
             state.unpublished_text(emitted_text="one two", split_cjk=True),
@@ -74,7 +74,7 @@ class TestCumulativeTranscriptState(CustomTestCase):
         )
 
     def test_repetition_after_prefix_advances_and_an_empty_continuation(self):
-        state = CumulativeTranscriptState(2.0, 2, 5)
+        state = StreamingASRState(2.0, 2, 5)
         emitted_text = ""
         phrase = "one two three four five six"
         deltas, suffixes = [], []
@@ -154,7 +154,7 @@ class TestTranscriptionBackendContract(CustomTestCase):
                     self.assertIs(caught.exception, callback_error)
 
         with patch(
-            "sglang.srt.entrypoints.openai.streaming_transcription.get_serving",
+            "sglang.srt.entrypoints.openai.streaming_asr.get_serving",
             return_value=SimpleNamespace(incremental_streaming_output=False),
         ):
             asyncio.run(run())
