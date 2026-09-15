@@ -242,16 +242,6 @@ def split_units(text: str) -> List[str]:
     return [text[start:end] for start, end in iter_unit_spans(text)]
 
 
-def _space_between(prev: str, cur: str) -> bool:
-    prev_char, cur_char = prev[-1], cur[0]
-    prev_script = _is_cjk(prev_char)
-    cur_script = _is_cjk(cur_char)
-    if not prev_script and not cur_script:
-        # Plain whitespace-delimited text: always one space, like " ".join.
-        return True
-    return needs_space(prev, cur)
-
-
 def join_text(left: str, right: str) -> str:
     """Append published text using the WS/SSE ASCII-space formatting rules."""
     parts = [left]
@@ -259,17 +249,6 @@ def join_text(left: str, right: str) -> str:
         if word:
             parts.append(f" {word}" if needs_space(parts[-1], word) else word)
     return "".join(parts)
-
-
-def join_units(units: Sequence[str]) -> str:
-    """Inverse of ``split_units`` up to the boundary spaces it cannot recover."""
-    text = ""
-    for unit in units:
-        if unit:
-            if text and _space_between(text, unit):
-                text += " "
-            text += unit
-    return text
 
 
 def normalize_unit(unit: str) -> str:
