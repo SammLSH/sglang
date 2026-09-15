@@ -1,21 +1,24 @@
-"""Split whole-audio processor features for existing multimodal caches.
-
-Models declare independently encodable frame boundaries and output lengths.
-The normal processor extracts the whole request once; this module partitions
-its features and audio-token span before hashing and transport. Encoder work
-and cache storage stay in the existing multimodal scheduler.
-"""
-
 from __future__ import annotations
 
-from typing import Any, Optional, Protocol, Sequence, runtime_checkable
+from typing import Optional, Sequence
 
 import msgspec
 import numpy as np
 import torch
+from pydantic import JsonValue
+from transformers import ProcessorMixin
 
 from sglang.srt.managers.mm_utils import hash_feature
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalDataValue,
+)
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
+    MultimodalSpecialTokens,
+)
 
 
 class EncoderWindowSpec(msgspec.Struct, frozen=True):
@@ -28,16 +31,18 @@ class EncoderWindowSpec(msgspec.Struct, frozen=True):
     # Merge shorter tails into the preceding complete window; 0 disables it.
     merge_tail_below_frames: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.window_frames <= 0 or self.alignment_frames <= 0:
             raise ValueError("encoder window frame counts must be positive")
-        if self.window_frames % self.alignment_frames:
+        elif self.window_frames % self.alignment_frames:
             raise ValueError(
                 f"encoder window of {self.window_frames} frames is not a multiple of "
                 f"the {self.alignment_frames}-frame encoder block"
             )
-        if not 0 <= self.merge_tail_below_frames <= self.window_frames:
+        elif not 0 <= self.merge_tail_below_frames <= self.window_frames:
             raise ValueError("encoder tail merge threshold must be within one window")
+        else:
+            return
 
 
 class EncoderWindowConfig(msgspec.Struct, frozen=True):
@@ -49,7 +54,7 @@ class EncoderWindowConfig(msgspec.Struct, frozen=True):
     # Extraction context before the request body, excluded from encoder input.
     leading_context_samples: int
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             min(
                 self.sample_rate,
@@ -61,67 +66,36 @@ class EncoderWindowConfig(msgspec.Struct, frozen=True):
             raise ValueError(
                 "audio window sample rate, sizes, and token count must be positive"
             )
-        if self.leading_context_samples < 0:
+        elif self.leading_context_samples < 0:
             raise ValueError("audio window leading context must be non-negative")
+        else:
+            return
 
     @property
     def window_seconds(self) -> float:
         return self.window_samples / self.sample_rate
 
 
-@runtime_checkable
-class EncoderWindowCapability(Protocol):
-    """Window metadata and item construction, independent of feature extraction.
-
-    The mixin supplies defaults for frame-based audio processors. A model with a
-    different sample/frame mapping or per-window metadata can override those parts
-    while keeping its normal whole-audio processor.
-    """
-
-    def encoder_window_spec(self) -> EncoderWindowSpec: ...
-
-    def encoder_window_config(
-        self, *, processor: Any = None
-    ) -> EncoderWindowConfig: ...
-
-    def encoder_window_output_lengths(
-        self, frame_lens: Sequence[int], *, processor: Any = None
-    ) -> list[int]: ...
-
-    def make_encoder_window_item(
-        self,
-        source: MultimodalDataItem,
-        *,
-        feature: torch.Tensor,
-        mask: torch.Tensor,
-        offsets: Sequence[tuple[int, int]],
-    ) -> MultimodalDataItem: ...
-
-
 def build_encoder_window_items(
-    cap: EncoderWindowCapability,
+    window_processor: EncoderWindowMixin,
     *,
     item: MultimodalDataItem,
     input_ids: torch.Tensor,
     placeholder_token_id: int,
     config: EncoderWindowConfig,
     leading_context_samples: int = 0,
-    processor: Any = None,
+    processor: Optional[ProcessorMixin] = None,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
-    """Partition already-extracted features and an expanded audio-token span.
-
-    Feature values retain the whole request's preprocessing semantics. Growing
-    or rolling audio can change old features; their hashes must then miss.
-    Leading context is removed after extraction and excluded from token counts.
-    """
-    spec = cap.encoder_window_spec()
+    """Split whole-request features and tokens, excluding extraction context."""
+    spec = window_processor.encoder_window_spec()
     feature = torch.as_tensor(item.feature)
-    mask = torch.as_tensor(getattr(item, spec.mask_key))
+    mask = torch.as_tensor(item.model_specific_data[spec.mask_key])
     if feature.ndim != 3 or mask.ndim != 2:
         raise ValueError(
             "encoder windowing requires batched audio features and a frame mask"
         )
-    time_dim = spec.feature_time_dim % feature.ndim
+    else:
+        time_dim = spec.feature_time_dim % feature.ndim
     if (
         feature.shape[0] != 1
         or time_dim == 0
@@ -130,33 +104,36 @@ def build_encoder_window_items(
         raise ValueError(
             "encoder windowing requires one audio feature batch and matching frame mask"
         )
-    valid_frames = int(mask.sum())
+    else:
+        valid_frames = int(mask.sum())
     expected_mask = (
         torch.arange(mask.shape[-1], device=mask.device)[None, :] < valid_frames
     )
     if not torch.equal(mask.bool(), expected_mask):
         raise ValueError("encoder windowing requires a contiguous valid-frame prefix")
-
-    samples_per_frame, remainder = divmod(config.window_samples, spec.window_frames)
+    else:
+        samples_per_frame, remainder = divmod(config.window_samples, spec.window_frames)
     if remainder or samples_per_frame <= 0:
         raise ValueError("encoder window samples must align to feature frames")
-    if (
+    elif (
         leading_context_samples not in (0, config.leading_context_samples)
         or leading_context_samples % samples_per_frame
     ):
         raise ValueError(
             "encoder window leading context must match the server frame configuration"
         )
-    leading_frames = leading_context_samples // samples_per_frame
-    body_frames = valid_frames - leading_frames
+    else:
+        leading_frames = leading_context_samples // samples_per_frame
+        body_frames = valid_frames - leading_frames
     if body_frames <= 0:
         raise ValueError(
             "encoder windowing requires non-empty audio after leading context"
         )
 
-    input_ids = torch.as_tensor(input_ids).flatten()
+    else:
+        input_ids = torch.as_tensor(input_ids).flatten()
     positions = (input_ids == placeholder_token_id).nonzero(as_tuple=True)[0]
-    original_tokens = cap.encoder_window_output_lengths(
+    original_tokens = window_processor.encoder_window_output_lengths(
         [valid_frames], processor=processor
     )[0]
     if (
@@ -167,22 +144,25 @@ def build_encoder_window_items(
         raise ValueError(
             "encoder windowing requires one expanded audio-token span matching the features"
         )
-    audio_start = int(positions[0])
-    audio_end = audio_start + original_tokens
+    else:
+        audio_start = int(positions[0])
+        audio_end = audio_start + original_tokens
 
     # Keep a short tail with its preceding window when the model needs that
     # grouping to encode it independently of other cache misses.
-    window_ends = list(range(spec.window_frames, body_frames + 1, spec.window_frames))
+    window_ends = list(range(spec.window_frames, body_frames, spec.window_frames))
     tail_frames = body_frames % spec.window_frames
     if window_ends and 0 < tail_frames < spec.merge_tail_below_frames:
-        window_ends.pop()
-    if not window_ends or window_ends[-1] < body_frames:
+        window_ends[-1] = body_frames
+    else:
         window_ends.append(body_frames)
     frame_lengths = [end - start for start, end in zip([0] + window_ends, window_ends)]
-    token_counts = cap.encoder_window_output_lengths(frame_lengths, processor=processor)
-    body_tokens = cap.encoder_window_output_lengths([body_frames], processor=processor)[
-        0
-    ]
+    token_counts = window_processor.encoder_window_output_lengths(
+        frame_lengths, processor=processor
+    )
+    body_tokens = window_processor.encoder_window_output_lengths(
+        [body_frames], processor=processor
+    )[0]
     if (
         len(token_counts) != len(frame_lengths)
         or any(count <= 0 for count in token_counts)
@@ -197,10 +177,11 @@ def build_encoder_window_items(
             "encoder window token counts must preserve the whole-audio length"
         )
 
-    items = []
+    else:
+        items = []
     frame_start, token_start = leading_frames, audio_start
     for frames, count in zip(frame_lengths, token_counts):
-        window_item = cap.make_encoder_window_item(
+        window_item = window_processor.make_encoder_window_item(
             item,
             feature=feature.narrow(time_dim, frame_start, frames).contiguous(),
             mask=mask[..., frame_start : frame_start + frames].contiguous(),
@@ -216,7 +197,9 @@ def build_encoder_window_items(
         input_ids = torch.cat(
             [input_ids[: audio_start + body_tokens], input_ids[audio_end:]]
         )
-    return items, input_ids
+        return items, input_ids
+    else:
+        return items, input_ids
 
 
 # Requests select windowing and carry leading context; sizes stay server-owned.
@@ -224,23 +207,22 @@ ENCODER_WINDOW_KWARG = "encoder_window"
 LEADING_CONTEXT_KEY = "leading_context_samples"
 
 
-def encoder_window_kwargs(*, leading_context_samples: int = 0) -> dict:
-    """Build the mm_processor_kwargs payload for one windowed request."""
-    return {ENCODER_WINDOW_KWARG: {LEADING_CONTEXT_KEY: int(leading_context_samples)}}
-
-
-class EncoderWindowMixin:
+class EncoderWindowMixin(BaseMultimodalProcessor):
     """Partition normal processor output using model-declared encoder windows."""
 
-    _cached_window_config: Optional[EncoderWindowConfig] = None
+    cached_window_config: Optional[EncoderWindowConfig] = None
 
     def encoder_window_spec(self) -> EncoderWindowSpec:
         raise NotImplementedError
 
-    def encoder_window_config(self, *, processor: Any = None) -> EncoderWindowConfig:
+    def encoder_window_config(
+        self, *, processor: Optional[ProcessorMixin] = None
+    ) -> EncoderWindowConfig:
         if self.audio_config.get("truncation", False):
             raise ValueError("encoder windowing requires audio truncation=False")
-        if self._cached_window_config is None:
+        elif self.cached_window_config is not None:
+            return self.cached_window_config
+        else:
             processor = self._processor if processor is None else processor
             spec = self.encoder_window_spec()
             extractor = processor.feature_extractor
@@ -249,19 +231,20 @@ class EncoderWindowMixin:
                 raise ValueError(
                     "feature extractor hop_length and n_fft must be positive"
                 )
-            self._cached_window_config = EncoderWindowConfig(
-                sample_rate=int(extractor.sampling_rate),
-                window_samples=spec.window_frames * hop_length,
-                window_tokens=self.encoder_window_output_lengths(
-                    [spec.window_frames], processor=processor
-                )[0],
-                # Preserve preceding half-frame samples, rounded to whole hops.
-                leading_context_samples=-(-(n_fft // 2) // hop_length) * hop_length,
-            )
-        return self._cached_window_config
+            else:
+                self.cached_window_config = EncoderWindowConfig(
+                    sample_rate=int(extractor.sampling_rate),
+                    window_samples=spec.window_frames * hop_length,
+                    window_tokens=self.encoder_window_output_lengths(
+                        [spec.window_frames], processor=processor
+                    )[0],
+                    # Preserve preceding half-frame samples, rounded to whole hops.
+                    leading_context_samples=-(-(n_fft // 2) // hop_length) * hop_length,
+                )
+        return self.cached_window_config
 
     def encoder_window_output_lengths(
-        self, frame_lens: Sequence[int], *, processor: Any = None
+        self, frame_lens: Sequence[int], *, processor: Optional[ProcessorMixin] = None
     ) -> list[int]:
         processor = self._processor if processor is None else processor
         return [
@@ -293,32 +276,36 @@ class EncoderWindowMixin:
 
     def process_and_combine_mm_data(
         self,
-        base_output,
-        mm_tokens,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
         *,
-        mm_processor_kwargs: Optional[dict] = None,
-        **kwargs,
-    ):
+        processor: Optional[ProcessorMixin] = None,
+        mm_processor_kwargs: Optional[dict[str, JsonValue]] = None,
+        **kwargs: object,
+    ) -> tuple[list[MultimodalDataItem], torch.Tensor, dict[str, MultimodalDataValue]]:
         window_request = (
             mm_processor_kwargs.get(ENCODER_WINDOW_KWARG)
             if mm_processor_kwargs
             else None
         )
         if window_request is None:
-            return super().process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
-        if not isinstance(window_request, dict):
+            return super().process_and_combine_mm_data(
+                base_output, mm_tokens, processor=processor, **kwargs
+            )
+        elif not isinstance(window_request, dict):
             raise ValueError(
                 f"mm_processor_kwargs[{ENCODER_WINDOW_KWARG!r}] must be a mapping"
             )
-        audios = base_output.audios or []
+        else:
+            audios = base_output.audios or []
         if len(audios) != 1 or len(base_output.organize_results()) != 1:
             raise ValueError(
                 "encoder windowing requires exactly one audio input and no other media"
             )
-        if not isinstance(audios[0], np.ndarray) or audios[0].ndim != 1:
+        elif not isinstance(audios[0], np.ndarray) or audios[0].ndim != 1:
             raise ValueError("encoder windowing requires mono raw audio samples")
-
-        processor, _ = self._resolve_processor(kwargs.pop("processor", None))
+        else:
+            processor, _ = self._resolve_processor(processor)
         config = self.encoder_window_config(processor=processor)
         # Reuse the normal whole-audio frontend, including preprocessing options
         # and tokenization. Partition before hashes and transport are finalized.
@@ -330,16 +317,18 @@ class EncoderWindowMixin:
         )
         if len(collected) != 1 or collected[0].modality != Modality.AUDIO:
             raise ValueError("encoder windowing requires one processed audio item")
-        token_id = mm_tokens.get_token_id_by_modality(Modality.AUDIO)
+        else:
+            token_id = mm_tokens.get_token_id_by_modality(Modality.AUDIO)
         if token_id is None:
             raise ValueError("encoder windowing requires an audio placeholder token id")
-        items, input_ids = build_encoder_window_items(
-            self,
-            item=collected[0],
-            input_ids=input_ids,
-            placeholder_token_id=token_id,
-            config=config,
-            leading_context_samples=int(window_request.get(LEADING_CONTEXT_KEY, 0)),
-            processor=processor,
-        )
+        else:
+            items, input_ids = build_encoder_window_items(
+                self,
+                item=collected[0],
+                input_ids=input_ids,
+                placeholder_token_id=token_id,
+                config=config,
+                leading_context_samples=int(window_request.get(LEADING_CONTEXT_KEY, 0)),
+                processor=processor,
+            )
         return self._finalize_mm_items(items, images=None), input_ids, ret

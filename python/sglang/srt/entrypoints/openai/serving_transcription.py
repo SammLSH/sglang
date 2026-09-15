@@ -27,7 +27,6 @@ import logging
 import math
 import time
 import uuid
-from copy import copy
 from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
 
 from fastapi import Request, WebSocket
@@ -80,16 +79,15 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._session_semaphore = asyncio.Semaphore(
             get_serving().asr_max_concurrent_sessions
         )
-        # Resolved once per server, not per connection: config validation
-        # runs the feature extractor and must fail here, at startup.
-        self._encoder_window = None
+        # Validate window geometry once at startup, before accepting sessions.
         serving_config = get_serving()
         if serving_config.enable_asr_encoder_window:
-            self._encoder_window = resolve_realtime_encoder_window_policy(
+            self.encoder_window = resolve_realtime_encoder_window_policy(
                 adapter=self._adapter,
                 tokenizer_manager=tokenizer_manager,
-                serving_config=serving_config,
             )
+        else:
+            self.encoder_window = None
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -758,11 +756,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     break
                 is_last = i == len(chunks) - 1
 
-                candidate = copy(state)
                 delta = await process_asr_chunk(
                     tokenizer_manager=self.tokenizer_manager,
                     adapter=self._adapter,
-                    state=candidate,
+                    state=state,
                     emitted_text=emitted_text,
                     audio_data=chunk_audio,
                     sampling_params=adapted_request.sampling_params,
@@ -787,8 +784,6 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     )
                     yield f"data: {chunk_resp.model_dump_json()}\n\n"
                     emitted_text += delta
-
-                state = candidate
 
             # Send final stop
             chunk_resp = TranscriptionStreamResponse(
@@ -820,5 +815,5 @@ class OpenAIServingTranscription(OpenAIServingBase):
             adapter=self._adapter,
             server_args=self.tokenizer_manager.server_args,
             session_semaphore=self._session_semaphore,
-            encoder_window=self._encoder_window,
+            encoder_window=self.encoder_window,
         )

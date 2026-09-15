@@ -1,12 +1,11 @@
-"""Cumulative audio requests and candidate outcomes for realtime transcription."""
-
 from __future__ import annotations
 
 import logging
 from copy import copy
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from msgspec.structs import replace
+from pydantic import JsonValue
 
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
     snapshot_samples,
@@ -60,7 +59,7 @@ class CumulativeMode(TranscriptionMode):
         state: RealtimeTranscriptionState,
         step: TranscriptionStep,
         *,
-        sampling_params: Dict[str, Any],
+        sampling_params: Dict[str, JsonValue],
         on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Reconcile complete hypotheses against the request's published prefix."""
@@ -72,7 +71,7 @@ class CumulativeMode(TranscriptionMode):
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
 
-        async def publish_snapshot(text: str) -> None:
+        async def _publish_snapshot(text: str) -> None:
             assert on_candidate is not None
             # The final unit may still be incomplete. Slice the original text
             # so mixed-language boundaries match the final candidate exactly.
@@ -81,13 +80,14 @@ class CumulativeMode(TranscriptionMode):
             snapshot = full[: spans[-2][1]] if len(spans) > 1 else ""
             if not snapshot or not snapshot.startswith(decoder_prefix):
                 return
-            candidate = apply_cumulative_transcript(
-                copy(transcript_before),
-                snapshot,
-                is_last=False,
-                emitted_text=step.emitted_text,
-            )
-            await on_candidate(candidate)
+            else:
+                candidate = apply_cumulative_transcript(
+                    copy(transcript_before),
+                    snapshot,
+                    is_last=False,
+                    emitted_text=step.emitted_text,
+                )
+                await on_candidate(candidate)
 
         generation = await generate_transcript(
             tokenizer_manager=self.tokenizer_manager,
@@ -96,20 +96,22 @@ class CumulativeMode(TranscriptionMode):
             audio_data=samples,
             sampling_params=sampling_params,
             routed_dp_rank=self.routed_dp_rank,
-            on_update=publish_snapshot if on_candidate is not None else None,
+            on_update=_publish_snapshot if on_candidate is not None else None,
         )
         if generation is None:
             if step.is_last:
                 raise RuntimeError("final realtime ASR request returned no response")
-            logger.warning("[realtime] cumulative ASR step returned no response")
+            else:
+                logger.warning("[realtime] cumulative ASR step returned no response")
             # Only the attempted cursor advances; the next decode covers the
             # retained audio again from offset zero.
             return TranscriptionOutcome(next_mode_state=before, audio_covered=False)
-        if generation.finish_reason == "length":
+        elif generation.finish_reason == "length":
             raise RuntimeError("realtime ASR decode reached max_new_tokens")
-        recovering_unprocessed_audio = (
-            step.last_attempted_offset_bytes > step.last_processed_offset_bytes
-        )
+        else:
+            recovering_unprocessed_audio = (
+                step.last_attempted_offset_bytes > step.last_processed_offset_bytes
+            )
         if (
             recovering_unprocessed_audio
             and transcript_before.full_transcript
@@ -117,11 +119,10 @@ class CumulativeMode(TranscriptionMode):
         ):
             if step.is_last:
                 raise RuntimeError("final realtime ASR recovery returned empty text")
-            return TranscriptionOutcome(
-                next_mode_state=replace(before, deferred_empty_continuation=False),
-                audio_covered=False,
-            )
-        transcript = copy(transcript_before)
+            else:
+                return TranscriptionOutcome(next_mode_state=before, audio_covered=False)
+        else:
+            transcript = copy(transcript_before)
         delta = apply_cumulative_transcript(
             transcript,
             decoder_prefix + generation.text,
@@ -129,12 +130,7 @@ class CumulativeMode(TranscriptionMode):
             emitted_text=step.emitted_text,
         )
         return TranscriptionOutcome(
-            next_mode_state=replace(
-                before,
-                transcript=transcript,
-                handoff_failures=0,
-                deferred_empty_continuation=False,
-            ),
+            next_mode_state=replace(before, transcript=transcript),
             audio_covered=True,
             delta=delta,
         )

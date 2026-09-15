@@ -7,7 +7,6 @@ from contextlib import aclosing
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
-    Any,
     Awaitable,
     Callable,
     Dict,
@@ -22,6 +21,7 @@ import msgspec
 import numpy as np
 import soundfile as sf
 from fastapi import HTTPException, Request
+from pydantic import JsonValue
 
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -41,17 +41,7 @@ _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 @dataclass
 class StreamingASRState:
-    """State for chunk-based streaming ASR with prefix rollback.
-
-    Published text belongs to the caller and is supplied to each operation.
-    Updating a candidate never records publication.
-
-    Parameters are model-specific and should be provided via the
-    adapter's ``chunked_streaming_config``.
-
-    Holdback counts words and individual CJK characters. Character offsets
-    preserve the candidate's boundary spaces when extending published text.
-    """
+    """Cumulative candidates with word/CJK holdback; published text belongs to callers."""
 
     chunk_size_sec: float
     unfixed_chunk_num: int
@@ -63,7 +53,8 @@ class StreamingASRState:
     def get_prefix_text(self, *, emitted_text: str) -> str:
         if self.chunk_index < self.unfixed_chunk_num or not emitted_text:
             return ""
-        return emitted_text
+        else:
+            return emitted_text
 
     def update(self, new_transcript: str, *, emitted_text: str) -> str:
         """Update the candidate hypothesis; the caller publishes the delta."""
@@ -72,22 +63,22 @@ class StreamingASRState:
         confirmed = (
             new_transcript[: spans[confirmed_units - 1][1]] if confirmed_units else ""
         )
-        delta = self._unpublished_delta(confirmed, emitted_text=emitted_text)
+        delta = self.unpublished_delta(confirmed, emitted_text=emitted_text)
         self.confirmed_text = confirmed
         self.full_transcript = new_transcript
         self.chunk_index += 1
         return delta
 
-    def _unpublished_delta(self, text: str, *, emitted_text: str) -> str:
+    def unpublished_delta(self, text: str, *, emitted_text: str) -> str:
         """Return an exact append, retaining rollback before prefix injection."""
         if text.startswith(emitted_text):
             return text[len(emitted_text) :]
-        # A shorter continuation can move holdback inside the published prefix.
-        if emitted_text.startswith(text):
+        elif emitted_text.startswith(text):
+            # Shorter continuations can move holdback inside published text.
             return ""
-        # Before prefix injection, hypotheses can revise earlier units. Keep
-        # the existing rollback behavior, slicing at the new candidate's offsets.
-        spans = list(iter_unit_spans(text))
+        else:
+            # Retain rollback before prefix injection, using candidate offsets.
+            spans = list(iter_unit_spans(text))
         common = common_unit_prefix(
             split_units(self.confirmed_text), [text[start:end] for start, end in spans]
         )
@@ -96,7 +87,7 @@ class StreamingASRState:
 
     def unpublished_text(self, *, emitted_text: str) -> str:
         """Read the exact unpublished append for finalization or window handoff."""
-        return self._unpublished_delta(self.full_transcript, emitted_text=emitted_text)
+        return self.unpublished_delta(self.full_transcript, emitted_text=emitted_text)
 
     def finalize(self, *, emitted_text: str) -> str:
         """Finalize the hypothesis; publishing and recording remain separate."""
@@ -134,7 +125,8 @@ def normalize_whitespace(text: str) -> str:
     """Normalize blank text and punctuation, preserving continuation spaces."""
     if not text.strip():
         return ""
-    return _PUNCT_WS_RE.sub(r"\1", text)
+    else:
+        return _PUNCT_WS_RE.sub(r"\1", text)
 
 
 _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
@@ -179,17 +171,14 @@ async def process_asr_chunk(
     adapter: TranscriptionAdapter,
     state: StreamingASRState,
     audio_data: bytes,
-    sampling_params: Dict[str, Any],
+    sampling_params: Dict[str, JsonValue],
     is_last: bool,
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
     *,
     emitted_text: str,
 ) -> str:
-    """Update a caller-owned candidate for one HTTP streaming chunk.
-
-    The caller accepts this candidate after publishing its returned delta.
-    """
+    """Update one HTTP chunk's text state and return its exact unpublished append."""
     decoder_prefix = state.get_prefix_text(emitted_text=emitted_text)
     try:
         result = await generate_transcript(
@@ -210,9 +199,13 @@ async def process_asr_chunk(
         raise
     if result is None:
         return ""
-    return apply_cumulative_transcript(
-        state, decoder_prefix + result.text, is_last=is_last, emitted_text=emitted_text
-    )
+    else:
+        return apply_cumulative_transcript(
+            state,
+            decoder_prefix + result.text,
+            is_last=is_last,
+            emitted_text=emitted_text,
+        )
 
 
 def iter_unit_spans(text: str) -> Iterator[tuple[int, int]]:
@@ -220,25 +213,19 @@ def iter_unit_spans(text: str) -> Iterator[tuple[int, int]]:
     start = None
     for index, char in enumerate(text):
         if char.isspace() or _is_cjk(char):
-            if start is not None:
-                yield start, index
-                start = None
-            if not char.isspace():
-                yield index, index + 1
-        elif start is None:
-            start = index
+            yield from ((start, index),) if start is not None else ()
+            yield from ((index, index + 1),) if not char.isspace() else ()
+            start = None
+        else:
+            start = index if start is None else start
     if start is not None:
         yield start, len(text)
+    else:
+        return
 
 
 def split_units(text: str) -> List[str]:
-    """Split text into reconciliation units.
-
-    Whitespace-separated tokens are kept whole unless they contain CJK
-    characters, in which case each such character becomes its own unit and
-    the Latin runs around them stay whole:
-    ``"hello 你好，world"`` -> ``["hello", "你", "好", "，", "world"]``.
-    """
+    """Split whitespace-separated words and individual CJK characters."""
     return [text[start:end] for start, end in iter_unit_spans(text)]
 
 
@@ -248,6 +235,8 @@ def join_text(left: str, right: str) -> str:
     for word in right.split(" "):
         if word:
             parts.append(f" {word}" if needs_space(parts[-1], word) else word)
+        else:
+            continue
     return "".join(parts)
 
 
@@ -270,19 +259,22 @@ def common_unit_prefix(
     ``normalize_unit``."""
     count = 0
     for left_unit, right_unit in zip(left, right):
-        if normalized:
-            if normalize_unit(left_unit) != normalize_unit(right_unit):
-                break
-        elif left_unit != right_unit:
+        matches = (
+            normalize_unit(left_unit) == normalize_unit(right_unit)
+            if normalized
+            else left_unit == right_unit
+        )
+        if not matches:
             break
-        count += 1
+        else:
+            count += 1
     return count
 
 
 class TranscriptionBackendAborted(RuntimeError):
     """The backend aborted the request instead of finishing it."""
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None):
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
         super().__init__(message)
         self.status_code = status_code
 
@@ -305,23 +297,16 @@ async def generate_transcript(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
     audio_data: Union[bytes, np.ndarray],
-    sampling_params: Dict[str, Any],
+    sampling_params: Dict[str, JsonValue],
     decoder_prefix: str = "",
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+    mm_processor_kwargs: Optional[Dict[str, JsonValue]] = None,
     routed_dp_rank: Optional[int] = None,
     on_update: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Optional[GeneratedTranscript]:
-    """Run one backend request and return its normalized transcript.
-
-    With ``on_update`` the backend request streams, and every partial decoder
-    snapshot the adapter deems visible is passed to the callback as
-    normalized cumulative text before the final result is returned.
-    ``decoder_prefix`` is transcript text appended to the adapter's prompt
-    for the model to continue; its snapshots are not held back
-    waiting for a leading marker the continuation never carries.
-    Results and snapshots contain only generated text, excluding that prefix.
+    """Decode one request; callbacks receive cumulative generated transcript text.
+    The supplied decoder_prefix is excluded from results and callbacks.
     """
     stream = on_update is not None
     chunk_request = GenerateReqInput(
@@ -355,55 +340,55 @@ async def generate_transcript(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 ):
                     raise
+                else:
+                    raise TranscriptionBackendAborted(
+                        str(error.detail), status_code=error.status_code
+                    ) from error
+            if finish_reason_type(ret) == "abort":
+                finish_reason = ret.get("meta_info", {}).get("finish_reason")
+                details = finish_reason if isinstance(finish_reason, dict) else {}
                 raise TranscriptionBackendAborted(
-                    str(error.detail), status_code=error.status_code
-                ) from error
-            _raise_for_aborted_response(ret)
-            if not stream:
+                    details.get("message") or "ASR backend request aborted",
+                    status_code=details.get("status_code"),
+                )
+            elif not stream:
                 break
-            chunk_text = ret.get("text") or ""
+            else:
+                chunk_text = ret.get("text") or ""
             cumulative_text = (
                 cumulative_text + chunk_text if incremental else chunk_text
             )
-            if _finish_reason_type(ret) == "length":
+            if finish_reason_type(ret) == "length":
                 # Let the caller handle truncation before this terminal frame
                 # publishes anything that would make a retry unsafe.
                 continue
-            visible_text = adapter.postprocess_streaming_text(
-                cumulative_text, continuation=bool(decoder_prefix)
-            )
+            else:
+                visible_text = adapter.postprocess_streaming_text(
+                    cumulative_text, continuation=bool(decoder_prefix)
+                )
             if visible_text is not None:
                 await on_update(normalize_whitespace(visible_text))
+            else:
+                continue
 
     if ret is None:
         logger.warning("[streaming_asr] ASR request returned no response")
         return None
 
-    raw_text = cumulative_text if stream else (ret.get("text") or "")
+    else:
+        raw_text = cumulative_text if stream else (ret.get("text") or "")
     return GeneratedTranscript(
         text=normalize_whitespace(adapter.postprocess_text(raw_text)),
-        finish_reason=_finish_reason_type(ret),
+        finish_reason=finish_reason_type(ret),
     )
 
 
-def _finish_reason_type(response: Dict[str, Any]) -> Optional[str]:
+def finish_reason_type(response: Dict[str, JsonValue]) -> Optional[str]:
     finish_reason = response.get("meta_info", {}).get("finish_reason")
     if isinstance(finish_reason, dict):
-        finish_reason = finish_reason.get("type")
-    return finish_reason
-
-
-def _raise_for_aborted_response(response: Dict[str, Any]) -> None:
-    if _finish_reason_type(response) != "abort":
-        return
-    finish_reason = response.get("meta_info", {}).get("finish_reason")
-    message = finish_reason.get("message") if isinstance(finish_reason, dict) else None
-    status_code = (
-        finish_reason.get("status_code") if isinstance(finish_reason, dict) else None
-    )
-    raise TranscriptionBackendAborted(
-        message or "ASR backend request aborted", status_code=status_code
-    )
+        return finish_reason.get("type")
+    else:
+        return finish_reason
 
 
 def apply_cumulative_transcript(
@@ -413,4 +398,5 @@ def apply_cumulative_transcript(
     if is_last:
         state.full_transcript = text
         return state.finalize(emitted_text=emitted_text)
-    return state.update(text, emitted_text=emitted_text)
+    else:
+        return state.update(text, emitted_text=emitted_text)

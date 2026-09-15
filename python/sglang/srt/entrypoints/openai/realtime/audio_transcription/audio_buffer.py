@@ -1,10 +1,3 @@
-"""Rolling PCM buffer and audio helpers for realtime ASR.
-
-Owns the current input buffer's PCM byte timeline. Resident bytes may be
-compacted after inference, but offsets remain absolute until commit or clear,
-so inference policy can keep valid cursors after bytes are dropped.
-"""
-
 import asyncio
 
 import msgspec
@@ -14,19 +7,8 @@ import numpy as np
 PCM_SAMPLE_WIDTH_BYTES = 2
 
 
-def pcm_to_float_samples(pcm: bytes) -> np.ndarray:
-    # /32768.0 matches soundfile.read's default int16 normalization, so the
-    # samples are bit-equal to the previous PCM -> WAV -> sf.read path.
-    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-
-
 class AudioBuffer(msgspec.Struct):
-    """Rolling PCM16 store addressed by absolute byte offsets.
-
-    Offsets count every byte the item ever received (0 = its first byte), so
-    cursors stay valid after old audio is dropped. ``data`` holds the resident
-    range ``[base_offset_bytes, received_bytes)``.
-    """
+    """Resident PCM16 range [base_offset_bytes, received_bytes), with absolute cursors."""
 
     data: bytearray = msgspec.field(default_factory=bytearray)
     # Resident bytes may start after offset zero once compaction drops them.
@@ -54,23 +36,23 @@ class AudioBuffer(msgspec.Struct):
                 f"[{start_offset_bytes}, {end_offset_bytes}) is outside resident "
                 f"[{self.base_offset_bytes}, {self.received_bytes})"
             )
-        return bytes(memoryview(self.data)[start:end])
+        else:
+            return bytes(memoryview(self.data)[start:end])
 
     def discard_before(self, offset_bytes: int) -> None:
         """Free memory by dropping all audio before an absolute offset."""
         if offset_bytes % PCM_SAMPLE_WIDTH_BYTES:
             raise ValueError("discard offset must be PCM16 sample-aligned")
-        if offset_bytes < self.base_offset_bytes or offset_bytes > self.received_bytes:
+        elif (
+            offset_bytes < self.base_offset_bytes or offset_bytes > self.received_bytes
+        ):
             raise ValueError(
                 f"discard offset {offset_bytes} is outside resident range "
                 f"[{self.base_offset_bytes}, {self.received_bytes}]"
             )
-        drop_bytes = offset_bytes - self.base_offset_bytes
-        if drop_bytes <= 0:
-            return
-
-        del self.data[:drop_bytes]
-        self.base_offset_bytes += drop_bytes
+        else:
+            del self.data[: offset_bytes - self.base_offset_bytes]
+            self.base_offset_bytes = offset_bytes
 
 
 async def snapshot_samples(
@@ -78,4 +60,9 @@ async def snapshot_samples(
 ) -> np.ndarray:
     """Copy PCM before converting it off the event loop."""
     pcm = audio.snapshot(start_offset_bytes, end_offset_bytes)
-    return await asyncio.to_thread(pcm_to_float_samples, pcm)
+
+    def _convert() -> np.ndarray:
+        # Match soundfile's PCM16 normalization used by the former WAV path.
+        return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+    return await asyncio.to_thread(_convert)

@@ -1,21 +1,14 @@
-"""Transcribe bounded audio context using the model's encoder-window boundaries.
-
-This module selects audio ranges, builds continuation prefixes, and handles
-candidate acceptance and recovery. The multimodal processor partitions features
-into encoder-window items; the scheduler and caches decide which items to encode.
-Model defaults and server overrides are resolved once for all connections.
-"""
-
 from __future__ import annotations
 
 import logging
 import math
 import zlib
 from copy import copy
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import msgspec
 from msgspec.structs import replace
+from pydantic import JsonValue
 
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
     PCM_SAMPLE_WIDTH_BYTES,
@@ -46,15 +39,15 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.encoder_window import (
-    EncoderWindowCapability,
     EncoderWindowConfig,
-    encoder_window_kwargs,
+    EncoderWindowMixin,
 )
+from sglang.srt.runtime_context import get_serving
 
 logger = logging.getLogger(__name__)
 
 # Failed window attempts allowed before fallback or termination.
-_MAX_CONSECUTIVE_WINDOW_FAILURES = 2
+MAX_CONSECUTIVE_WINDOW_FAILURES = 2
 
 
 class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
@@ -72,31 +65,24 @@ class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
         return self.config.window_samples * PCM_SAMPLE_WIDTH_BYTES
 
     @property
-    def context_bytes(self) -> int:
+    def leading_context_bytes(self) -> int:
         return self.config.leading_context_samples * PCM_SAMPLE_WIDTH_BYTES
 
     def activation_threshold_bytes(
         self, chunk_size_bytes: int, chunk_size_sec: float
     ) -> int:
-        """Return the encoder window activation threshold in audio bytes.
-
-        Round up to a whole number of inference chunks. Activation requires
-        a non-final decode ending strictly after this threshold.
-        """
+        """Round up to a chunk boundary; activation requires a later non-final end."""
         return math.ceil(self.policy.min_audio_sec / chunk_size_sec) * chunk_size_bytes
 
     def pinned_dp_rank(self, session_id: str) -> Optional[int]:
         if self.dp_size <= 1:
             return None
-        return zlib.crc32(session_id.encode("utf-8")) % self.dp_size
+        else:
+            return zlib.crc32(session_id.encode("utf-8")) % self.dp_size
 
 
 class EncoderWindowMode(TranscriptionMode):
-    """Select window-aligned audio and reconcile its transcription continuation.
-
-    Handoff, retries, and PCM retention follow transcript progress. Cache hits
-    only reduce encoder/decoder work; they do not change this mode's state.
-    """
+    """Choose aligned audio and confirm continuations independently of cache hits."""
 
     def __init__(
         self,
@@ -114,7 +100,7 @@ class EncoderWindowMode(TranscriptionMode):
         window_bytes = encoder_window.window_bytes
         # Allow one extra window to resolve a stall, including a first
         # handoff whose activation threshold exceeds the rolling context.
-        self._max_retained_bytes = (
+        self.max_retained_bytes = (
             max(
                 (encoder_window.policy.max_audio_context_windows + 1) * window_bytes,
                 activation_threshold_bytes + chunk_size_bytes,
@@ -156,7 +142,7 @@ class EncoderWindowMode(TranscriptionMode):
         else:
             suffix_state = current.suffix
             handoff_pending = ""
-            start_offset_bytes = self._encoder_window_start_offset(
+            start_offset_bytes = self.encoder_window_start_offset(
                 state, end_offset_bytes
             )
         decoder_prefix = suffix_state.bounded_prefix(
@@ -170,23 +156,24 @@ class EncoderWindowMode(TranscriptionMode):
             raise RuntimeError(
                 "realtime ASR decoder prefix budget cannot retain a complete text unit"
             )
-        return TranscriptionStep(
-            is_last=is_last,
-            start_offset_bytes=start_offset_bytes,
-            end_offset_bytes=end_offset_bytes,
-            last_attempted_offset_bytes=state.audio.last_attempted_offset_bytes,
-            last_processed_offset_bytes=state.audio.last_processed_offset_bytes,
-            emitted_text=state.emitted_text,
-            mode_state=current,
-            leading_context_bytes=min(
-                self.encoder_window.context_bytes,
-                start_offset_bytes - state.audio.base_offset_bytes,
-            ),
-            decoder_prefix=decoder_prefix,
-            handoff_pending=handoff_pending,
-        )
+        else:
+            return TranscriptionStep(
+                is_last=is_last,
+                start_offset_bytes=start_offset_bytes,
+                end_offset_bytes=end_offset_bytes,
+                last_attempted_offset_bytes=state.audio.last_attempted_offset_bytes,
+                last_processed_offset_bytes=state.audio.last_processed_offset_bytes,
+                emitted_text=state.emitted_text,
+                mode_state=current,
+                leading_context_bytes=min(
+                    self.encoder_window.leading_context_bytes,
+                    start_offset_bytes - state.audio.base_offset_bytes,
+                ),
+                decoder_prefix=decoder_prefix,
+                handoff_pending=handoff_pending,
+            )
 
-    def _encoder_window_start_offset(
+    def encoder_window_start_offset(
         self, state: RealtimeTranscriptionState, end_offset_bytes: int
     ) -> int:
         """Keep starts window-aligned without advancing past unconfirmed audio."""
@@ -204,25 +191,31 @@ class EncoderWindowMode(TranscriptionMode):
         if audio.base_offset_bytes == 0:
             floor = 0
         else:
-            resident = audio.base_offset_bytes + self.encoder_window.context_bytes
+            resident = (
+                audio.base_offset_bytes + self.encoder_window.leading_context_bytes
+            )
             floor = -(-resident // window_bytes) * window_bytes
         # A small amount of text after a stall cannot release the retained
         # interval at once. Advance by at most one native window.
         start = max(floor, min(start, floor + window_bytes))
-        if current.unconfirmed_start is not None:
-            start = min(start, current.unconfirmed_start)
-        if end_offset_bytes - start > self._max_retained_bytes:
+        start = (
+            min(start, current.unconfirmed_start_offset_bytes)
+            if current.unconfirmed_start_offset_bytes is not None
+            else start
+        )
+        if end_offset_bytes - start > self.max_retained_bytes:
             raise RuntimeError(
                 "realtime ASR transcript did not advance within the retained audio limit"
             )
-        return start
+        else:
+            return start
 
     async def execute_step(
         self,
         state: RealtimeTranscriptionState,
         step: TranscriptionStep,
         *,
-        sampling_params: Dict[str, Any],
+        sampling_params: Dict[str, JsonValue],
         on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Decode and reconcile without modifying the step's accepted text state."""
@@ -232,21 +225,22 @@ class EncoderWindowMode(TranscriptionMode):
             if isinstance(before, WindowedState)
             else TranscriptionSuffixState(pending=step.handoff_pending)
         )
-        if step.start_offset_bytes % self.encoder_window.window_bytes:
-            raise RuntimeError("encoder-window request is not window aligned")
+        # build_step aligns starts before taking this snapshot.
+        assert step.start_offset_bytes % self.encoder_window.window_bytes == 0
         samples = await snapshot_samples(
             state.audio,
             step.start_offset_bytes - step.leading_context_bytes,
             step.end_offset_bytes,
         )
 
-        async def publish_snapshot(text: str) -> None:
+        async def _publish_snapshot(text: str) -> None:
             assert on_candidate is not None
             spans = list(iter_unit_spans(text))
             if len(spans) < 2:
                 return
-            # Hold the incomplete last unit, preserving the candidate's spacing.
-            snapshot = text[: spans[-2][1]]
+            else:
+                # Hold the incomplete last unit without changing spacing.
+                snapshot = text[: spans[-2][1]]
             candidate = suffix_before.reconcile(
                 snapshot,
                 is_last=step.is_last,
@@ -261,26 +255,31 @@ class EncoderWindowMode(TranscriptionMode):
                 audio_data=samples,
                 sampling_params=sampling_params,
                 decoder_prefix=step.decoder_prefix,
-                mm_processor_kwargs=encoder_window_kwargs(
-                    leading_context_samples=step.leading_context_bytes
-                    // PCM_SAMPLE_WIDTH_BYTES,
-                ),
+                mm_processor_kwargs={
+                    "encoder_window": {
+                        "leading_context_samples": step.leading_context_bytes
+                        // PCM_SAMPLE_WIDTH_BYTES,
+                    }
+                },
                 routed_dp_rank=self.routed_dp_rank,
-                on_update=publish_snapshot if on_candidate is not None else None,
+                on_update=_publish_snapshot if on_candidate is not None else None,
             )
         except TranscriptionBackendAborted as error:
-            return self._failed_outcome(state, step, error)
+            return self.failed_outcome(state, step, error)
         if generation is None:
-            return self._failed_outcome(
+            return self.failed_outcome(
                 state, step, RuntimeError("realtime ASR request returned no response")
             )
-        if generation.finish_reason == "length":
-            return self._failed_outcome(
+        elif generation.finish_reason == "length":
+            return self.failed_outcome(
                 state, step, RuntimeError("realtime ASR decode reached max_new_tokens")
             )
-        return self._reconcile_encoder_window_text(step, suffix_before, generation.text)
+        else:
+            return self.reconcile_encoder_window_text(
+                step, suffix_before, generation.text
+            )
 
-    def _failed_outcome(
+    def failed_outcome(
         self,
         state: RealtimeTranscriptionState,
         step: TranscriptionStep,
@@ -293,35 +292,39 @@ class EncoderWindowMode(TranscriptionMode):
             or (isinstance(error, TranscriptionBackendAborted) and not error.retryable)
         ):
             raise error
-        logger.warning(
-            "[realtime] encoder-window ASR step failed (%s); retaining audio", error
-        )
+        else:
+            logger.warning(
+                "[realtime] encoder-window ASR step failed (%s); retaining audio", error
+            )
         before = step.mode_state
         if isinstance(before, CumulativeState):
             failures = before.handoff_failures + 1
-            disabled = failures >= _MAX_CONSECUTIVE_WINDOW_FAILURES
+            disabled = failures >= MAX_CONSECUTIVE_WINDOW_FAILURES
             if disabled:
                 logger.warning(
                     "[realtime] encoder-window handoff failed %d times; this item "
                     "falls back to cumulative transcription",
                     failures,
                 )
-            next_state = replace(
-                before, handoff_failures=failures, window_disabled=disabled
-            )
+                next_state = replace(
+                    before, handoff_failures=failures, window_disabled=True
+                )
+            else:
+                next_state = replace(before, handoff_failures=failures)
         else:
             failures = before.consecutive_failures + 1
-            if failures >= _MAX_CONSECUTIVE_WINDOW_FAILURES:
+            if failures >= MAX_CONSECUTIVE_WINDOW_FAILURES:
                 # Old PCM may already be gone after activation. Leave the
                 # accepted state intact and fail instead of switching back.
                 raise RuntimeError(
                     "encoder-window ASR failed repeatedly after activation"
                 )
-            next_state = replace(before, consecutive_failures=failures)
+            else:
+                next_state = replace(before, consecutive_failures=failures)
         # Record the attempt without advancing processed audio or releasing PCM.
         return TranscriptionOutcome(next_mode_state=next_state, audio_covered=False)
 
-    def _reconcile_encoder_window_text(
+    def reconcile_encoder_window_text(
         self,
         step: TranscriptionStep,
         suffix_state: TranscriptionSuffixState,
@@ -340,7 +343,8 @@ class EncoderWindowMode(TranscriptionMode):
             and not text
         ):
             raise RuntimeError("final realtime ASR recovery returned empty text")
-        before = step.mode_state
+        else:
+            before = step.mode_state
         if (
             update.empty_continuation
             and not step.is_last
@@ -348,31 +352,39 @@ class EncoderWindowMode(TranscriptionMode):
             and not before.deferred_empty_continuation
         ):
             # An empty first continuation remains a cumulative handoff attempt.
-            next_state = replace(before, deferred_empty_continuation=True)
-            if isinstance(next_state, WindowedState):
+            if isinstance(before, WindowedState):
                 next_state = replace(
-                    next_state, unconfirmed_start=step.start_offset_bytes
+                    before,
+                    deferred_empty_continuation=True,
+                    unconfirmed_start_offset_bytes=step.start_offset_bytes,
                 )
+            else:
+                next_state = replace(before, deferred_empty_continuation=True)
             return TranscriptionOutcome(next_mode_state=next_state, audio_covered=False)
-        audio_covered = (
-            step.is_last
-            or bool(update.delta)
-            # Confirmed holdback is retained in decoder context. Unconfirmed
-            # candidates still require their audio to remain available.
-            or len(update.pending) == update.confirmed_pending_chars
-        )
+        else:
+            # Confirmed holdback is carried in the next decoder prefix.
+            audio_covered = (
+                step.is_last
+                or bool(update.delta)
+                or len(update.pending) == update.confirmed_pending_chars
+            )
         return TranscriptionOutcome(
             next_mode_state=WindowedState(
                 suffix=TranscriptionSuffixState(
                     pending=update.pending,
                     confirmed_pending_chars=update.confirmed_pending_chars,
                 ),
-                unconfirmed_start=None if audio_covered else step.start_offset_bytes,
+                unconfirmed_start_offset_bytes=None
+                if audio_covered
+                else step.start_offset_bytes,
             ),
             audio_covered=audio_covered,
             delta=update.delta,
             discard_before_bytes=(
-                max(0, step.start_offset_bytes - self.encoder_window.context_bytes)
+                max(
+                    0,
+                    step.start_offset_bytes - self.encoder_window.leading_context_bytes,
+                )
                 if audio_covered and not step.is_last
                 else None
             ),
@@ -394,54 +406,46 @@ def resolve_realtime_encoder_window_policy(
     *,
     adapter: TranscriptionAdapter,
     tokenizer_manager: TokenizerManager,
-    serving_config: Any,
 ) -> Optional[ResolvedEncoderWindowPolicy]:
-    """Build an encoder window policy from adapter defaults and server overrides.
-
-    If the adapter or processor lacks encoder window support, warn and return
-    None to keep realtime ASR in cumulative mode. A missing tokenizer or invalid
-    encoder window config raises an error during startup.
-    """
+    """Resolve model window geometry and serving overrides at startup."""
+    serving_config = get_serving()
     mm_processor = tokenizer_manager.mm_processor
     tokenizer = tokenizer_manager.tokenizer
     max_buffer_seconds = serving_config.asr_max_buffer_seconds
     dp_size = tokenizer_manager.elastic_worker_count
 
     policy = adapter.realtime_encoder_window_policy
-    if policy is None or not isinstance(mm_processor, EncoderWindowCapability):
+    if policy is None or not isinstance(mm_processor, EncoderWindowMixin):
         logger.warning(
             "[realtime] --enable-asr-encoder-window is set but the model or its "
             "transcription adapter does not declare encoder windowing; realtime "
             "transcription stays cumulative"
         )
         return None
-    if not isinstance(policy, RealtimeEncoderWindowPolicy):
-        raise TypeError(
-            "realtime_encoder_window_policy must return RealtimeEncoderWindowPolicy"
-        )
-    overrides = {
-        "min_audio_sec": serving_config.asr_encoder_window_min_audio_seconds,
-        "max_audio_context_windows": serving_config.asr_encoder_window_max_context_windows,
-        "decoder_prefix_max_tokens": serving_config.asr_decoder_prefix_max_tokens,
-        "decoder_prefix_holdback_units": serving_config.asr_decoder_prefix_holdback_units,
-    }
+    else:
+        overrides = {
+            "min_audio_sec": serving_config.asr_encoder_window_min_audio_seconds,
+            "max_audio_context_windows": serving_config.asr_encoder_window_max_context_windows,
+            "decoder_prefix_max_tokens": serving_config.asr_decoder_prefix_max_tokens,
+            "decoder_prefix_holdback_units": serving_config.asr_decoder_prefix_holdback_units,
+        }
     overrides = {name: value for name, value in overrides.items() if value is not None}
-    if overrides:
-        policy = replace(policy, **overrides)
+    policy = replace(policy, **overrides) if overrides else policy
     if tokenizer is None:
         raise RuntimeError(
             "encoder-window ASR requires a tokenizer for the decoder prefix"
         )
-
-    config = mm_processor.encoder_window_config()
+    else:
+        config = mm_processor.encoder_window_config()
     if config.sample_rate != adapter.model_sample_rate:
         raise ValueError(
             f"feature extractor sample rate {config.sample_rate} differs from the "
             f"model sample rate {adapter.model_sample_rate}"
         )
-    resolved = ResolvedEncoderWindowPolicy(
-        config=config, policy=policy, dp_size=max(1, int(dp_size))
-    )
+    else:
+        resolved = ResolvedEncoderWindowPolicy(
+            config=config, policy=policy, dp_size=max(1, int(dp_size))
+        )
     chunk_seconds = adapter.chunked_streaming_config["chunk_size_sec"]
     bytes_per_second = adapter.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
     chunk_bytes = int(chunk_seconds * bytes_per_second)
@@ -457,16 +461,17 @@ def resolve_realtime_encoder_window_policy(
             first_window_end / bytes_per_second,
             max_buffer_seconds,
         )
-    logger.info(
-        "[realtime] encoder windowing enabled: %.1f s windows of %d tokens, "
-        "activation after %g s, max_context_windows %d, dp_size %d, "
-        "prefix_tokens %d, holdback_units %d",
-        config.window_seconds,
-        config.window_tokens,
-        policy.min_audio_sec,
-        policy.max_audio_context_windows,
-        dp_size,
-        policy.decoder_prefix_max_tokens,
-        policy.decoder_prefix_holdback_units,
-    )
+    else:
+        logger.info(
+            "[realtime] encoder windowing enabled: %.1f s windows of %d tokens, "
+            "activation after %g s, max_context_windows %d, dp_size %d, "
+            "prefix_tokens %d, holdback_units %d",
+            config.window_seconds,
+            config.window_tokens,
+            policy.min_audio_sec,
+            policy.max_audio_context_windows,
+            dp_size,
+            policy.decoder_prefix_max_tokens,
+            policy.decoder_prefix_holdback_units,
+        )
     return resolved

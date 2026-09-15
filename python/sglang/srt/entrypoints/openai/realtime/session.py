@@ -50,6 +50,7 @@ from openai.types.realtime.realtime_conversation_item_user_message import (
 )
 from openai.types.realtime.realtime_error import RealtimeError
 from pydantic import BaseModel, ValidationError
+from starlette.types import Message
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
@@ -80,10 +81,10 @@ logger = logging.getLogger(__name__)
 
 # 60 s * 48,000 samples/s * 2 bytes/sample (PCM16) * 2 for base64/JSON
 # overhead = 11,520,000 bytes. Raising the item limit must not grow this backlog.
-_MAX_PENDING_INPUT_BYTES = 11_520_000
+MAX_PENDING_INPUT_BYTES = 11_520_000
 
 # Conservative per-frame bookkeeping budget, including empty frames.
-_QUEUED_FRAME_OVERHEAD_BYTES = 256
+QUEUED_FRAME_OVERHEAD_BYTES = 256
 
 
 def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
@@ -177,8 +178,8 @@ class RealtimeConnection:
         self.transcription_state = self.transcription_processor.create_state()
 
         self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
-        self._incoming_messages: asyncio.Queue[tuple[dict, int]] = asyncio.Queue()
-        self._pending_input_bytes = 0
+        self.incoming_messages: asyncio.Queue[tuple[Message, int]] = asyncio.Queue()
+        self.pending_input_bytes = 0
 
     async def run(self) -> None:
         await self._send(
@@ -192,7 +193,7 @@ class RealtimeConnection:
         try:
             # Keep receiving while inference waits, so disconnects and backlog
             # overflow can cancel the active backend request promptly.
-            receiver_task = asyncio.create_task(self._receive_messages())
+            receiver_task = asyncio.create_task(self.receive_messages())
             consumer_task = asyncio.create_task(self._run_loop())
             overflow = False
             try:
@@ -210,8 +211,8 @@ class RealtimeConnection:
                 await asyncio.gather(
                     receiver_task, consumer_task, return_exceptions=True
                 )
-                self._incoming_messages = asyncio.Queue()
-                self._pending_input_bytes = 0
+                self.incoming_messages = asyncio.Queue()
+                self.pending_input_bytes = 0
 
             if overflow:
                 # Overflow belongs to the connection, not the interrupted event.
@@ -238,26 +239,25 @@ class RealtimeConnection:
                     e,
                 )
 
-    async def _receive_messages(self) -> bool:
+    async def receive_messages(self) -> bool:
         """Queue raw WebSocket frames; return True if the backlog exceeds its cap."""
         while True:
-            try:
-                message = await self.websocket.receive()
-            except RuntimeError as e:
-                raise WebSocketDisconnect() from e
+            message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":
                 raise WebSocketDisconnect(code=message.get("code", 1000))
-            size = (
-                len((message.get("text") or "").encode("utf-8"))
-                + len(message.get("bytes") or b"")
-                + _QUEUED_FRAME_OVERHEAD_BYTES
-            )
-            if self._pending_input_bytes + size > _MAX_PENDING_INPUT_BYTES:
+            else:
+                size = (
+                    len((message.get("text") or "").encode("utf-8"))
+                    + len(message.get("bytes") or b"")
+                    + QUEUED_FRAME_OVERHEAD_BYTES
+                )
+            if self.pending_input_bytes + size > MAX_PENDING_INPUT_BYTES:
                 # Waiting for queue space would hide disconnects behind audio.
                 return True
-            self._pending_input_bytes += size
-            self._incoming_messages.put_nowait((message, size))
-            await asyncio.sleep(0)
+            else:
+                self.pending_input_bytes += size
+                self.incoming_messages.put_nowait((message, size))
+                await asyncio.sleep(0)
 
     async def _run_loop(self) -> None:
         """Receive-and-dispatch loop. Validation errors emit an error event
@@ -268,8 +268,8 @@ class RealtimeConnection:
             self._current_client_event_id = None
             # A nonempty queue and short handlers may otherwise never yield.
             await asyncio.sleep(0)
-            message, size = await self._incoming_messages.get()
-            self._pending_input_bytes -= size
+            message, size = await self.incoming_messages.get()
+            self.pending_input_bytes -= size
 
             text = message.get("text")
             if not text:

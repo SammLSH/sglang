@@ -71,13 +71,11 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def postprocess_streaming_text(
         self, text: str, *, continuation: bool = False
     ) -> Optional[str]:
-        # The forced "language xx<asr_text>" prefix may span several decoder
-        # updates; nothing before the delimiter is transcript text. A prompt
-        # that already ends with transcript text is continued without the
-        # prefix, so waiting for the delimiter would hide every snapshot.
+        # Buffer split language markers; transcript continuations have no marker.
         if not continuation and self.ASR_TEXT_TAG not in text:
             return None
-        return self.postprocess_text(text)
+        else:
+            return self.postprocess_text(text)
 
     def build_verbose_response(
         self,

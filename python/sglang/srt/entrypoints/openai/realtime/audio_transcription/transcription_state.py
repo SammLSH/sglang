@@ -1,5 +1,3 @@
-"""Per-item audio progress, publication, and the active transcription mode state."""
-
 from __future__ import annotations
 
 import msgspec
@@ -32,19 +30,14 @@ class WindowedState(msgspec.Struct, frozen=True, tag="windowed"):
     consecutive_failures: int = 0
     deferred_empty_continuation: bool = False
     # Keep the request start fixed while decoded text is still unconfirmed.
-    unconfirmed_start: int | None = None
+    unconfirmed_start_offset_bytes: int | None = None
 
 
 ModeState = CumulativeState | WindowedState
 
 
 class RealtimeTranscriptionState(msgspec.Struct):
-    """One audio item's shared facts and exactly one accepted mode state.
-
-    Only the processor appends emitted_text after successful sends.
-    Modes read the accepted mode_state and copy text state before modifying it;
-    the processor replaces mode_state at commit.
-    """
+    """One item's PCM, successfully published text, and accepted mode state."""
 
     audio: AudioBuffer
     mode_state: ModeState
@@ -58,7 +51,8 @@ class RealtimeTranscriptionState(msgspec.Struct):
     def has_transcript(self) -> bool:
         if isinstance(self.mode_state, CumulativeState):
             return bool(self.mode_state.transcript.full_transcript)
-        return bool(self.emitted_text or self.mode_state.suffix.pending)
+        else:
+            return bool(self.emitted_text or self.mode_state.suffix.pending)
 
     @property
     def has_new_audio(self) -> bool:

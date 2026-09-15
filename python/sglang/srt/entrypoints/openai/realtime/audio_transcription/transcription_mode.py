@@ -1,11 +1,10 @@
-"""Transcription mode interface and per-step input and outcome types."""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable, Dict, Optional
 
 import msgspec
+from pydantic import JsonValue
 
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
     ModeState,
@@ -22,13 +21,7 @@ TranscriptCandidateCallback = Callable[[str], Awaitable[None]]
 
 
 class TranscriptionStep(msgspec.Struct, frozen=True):
-    """Request and candidate baseline fixed before generation awaits.
-
-    The session's single consumer keeps mode_state unchanged during a step.
-    Modes read this accepted state and copy mutable text state before updates.
-    Published text and audio cursors are snapshots, so intermediate sends
-    cannot change the reconciliation baseline of this request.
-    """
+    """Fixed request baseline; the single consumer leaves mode_state unchanged."""
 
     is_last: bool
     start_offset_bytes: int
@@ -45,11 +38,7 @@ class TranscriptionStep(msgspec.Struct, frozen=True):
 
 
 class TranscriptionOutcome(msgspec.Struct, frozen=True):
-    """Changes accepted after publication, including recoverable attempts.
-
-    Modes decide their next working state and safe PCM release boundary.
-    Audio coverage is independent of candidate acceptance and mode handoff.
-    """
+    """Candidate state and independent audio progress accepted after publication."""
 
     next_mode_state: ModeState
     audio_covered: bool
@@ -90,7 +79,7 @@ class TranscriptionMode(ABC):
         state: RealtimeTranscriptionState,
         step: TranscriptionStep,
         *,
-        sampling_params: Dict[str, Any],
+        sampling_params: Dict[str, JsonValue],
         on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Compute candidates and return proposed changes for the caller to commit."""

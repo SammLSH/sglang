@@ -1,15 +1,7 @@
-"""Bounded decoder prefix and suffix reconciliation for windowed realtime ASR.
-
-Once encoder windowing is active, each request continues a bounded text prefix.
-Common units from consecutive candidates are published minus a small holdback.
-When the entire pending candidate agrees, its held tail also enters the next
-decoder prefix so it survives audio compaction without forcing publication.
-Generated text is a suffix, including genuine repeated speech.
-"""
-
 from __future__ import annotations
 
 import msgspec
+from transformers import PreTrainedTokenizerBase
 
 from sglang.srt.entrypoints.openai.streaming_asr import (
     _is_cjk,
@@ -18,9 +10,8 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     split_units,
 )
 
-# Character budget for the tokenizer round trip in bounded_prefix; generous
-# enough that any real tokenizer needs fewer characters than this per token.
-_MAX_CHARS_PER_TOKEN = 64
+# Limit tokenizer input work; the actual token budget is checked after truncation.
+MAX_CHARS_PER_TOKEN = 64
 
 
 class SuffixUpdate(msgspec.Struct, frozen=True):
@@ -36,31 +27,27 @@ class SuffixUpdate(msgspec.Struct, frozen=True):
     empty_continuation: bool = False
 
 
-def _align_to_unit_boundary(source: str, tail: str) -> str:
+def align_to_unit_boundary(source: str, tail: str) -> str:
     """Drop a leading partial unit introduced by token-level slicing."""
     tail = tail.lstrip()
     if not tail:
         return ""
-    if source.endswith(tail):
+    else:
         start = len(source) - len(tail)
-        if (
-            start == 0
-            or source[start - 1].isspace()
-            or _is_cjk(source[start - 1])
-            or _is_cjk(tail[0])
-        ):
-            return tail
-    units = split_units(tail)
-    if len(units) <= 1:
-        return ""
-    return tail[len(units[0]) :].lstrip()
+    if source.endswith(tail) and (
+        start == 0
+        or source[start - 1].isspace()
+        or _is_cjk(source[start - 1])
+        or _is_cjk(tail[0])
+    ):
+        return tail
+    else:
+        units = split_units(tail)
+        return tail[len(units[0]) :].lstrip() if len(units) > 1 else ""
 
 
 class TranscriptionSuffixState(msgspec.Struct):
-    """Unpublished continuation text and its confirmed prefix.
-
-    Published text is supplied by the caller when building decoder context.
-    """
+    """Unpublished continuation and its confirmed prefix; published text is external."""
 
     # Exact unpublished suffix, including any separator after published text.
     # Its confirmed prefix is also supplied to the decoder.
@@ -71,21 +58,38 @@ class TranscriptionSuffixState(msgspec.Struct):
     def confirmed_pending(self) -> str:
         return self.pending[: self.confirmed_pending_chars]
 
-    def bounded_prefix(self, tokenizer, max_tokens: int, *, emitted_text: str) -> str:
-        """The most recent confirmed text, at most ``max_tokens`` tokens long,
-        starting on a unit boundary."""
-        source = emitted_text + self.confirmed_pending
-        if not source or max_tokens <= 0:
+    def bounded_prefix(
+        self, tokenizer: PreTrainedTokenizerBase, max_tokens: int, *, emitted_text: str
+    ) -> str:
+        """Bound recent confirmed context by tokens, retaining whole text units."""
+        if max_tokens <= 0:
             return ""
-        tail = source[-max_tokens * _MAX_CHARS_PER_TOKEN :]
+        else:
+            max_chars = max_tokens * MAX_CHARS_PER_TOKEN
+        # Retain one predecessor character for partial-word boundary checks.
+        pending_start = max(0, self.confirmed_pending_chars - max_chars - 1)
+        confirmed_tail = self.pending[pending_start : self.confirmed_pending_chars]
+        history_chars = max_chars + 1 - len(confirmed_tail)
+        source = (
+            emitted_text[-history_chars:] + confirmed_tail
+            if history_chars
+            else confirmed_tail
+        )
+        if not source:
+            return ""
+        else:
+            tail = source[-max_chars:]
         token_ids = tokenizer.encode(tail, add_special_tokens=False)
-        if len(token_ids) > max_tokens:
-            tail = tokenizer.decode(
+        tail = (
+            tokenizer.decode(
                 token_ids[-max_tokens:],
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-        tail = _align_to_unit_boundary(source, tail)
+            if len(token_ids) > max_tokens
+            else tail
+        )
+        tail = align_to_unit_boundary(source, tail)
         # Removing a leading space or partial unit can change tokenization.
         # Check the actual prefix, dropping whole units until it fits.
         while (
@@ -106,31 +110,38 @@ class TranscriptionSuffixState(msgspec.Struct):
         if not continuation.strip():
             if is_last:
                 return SuffixUpdate(delta=self.pending, pending="")
-            return SuffixUpdate(
-                delta="",
-                pending=self.pending,
-                confirmed_pending_chars=self.confirmed_pending_chars,
-                empty_continuation=True,
-            )
-        # The decoder already received the confirmed holdback. Preserve exact
-        # character continuation: "car" + "pet" differs from "car" + " pet".
-        candidate = self.confirmed_pending + continuation
+            else:
+                return SuffixUpdate(
+                    delta="",
+                    pending=self.pending,
+                    confirmed_pending_chars=self.confirmed_pending_chars,
+                    empty_continuation=True,
+                )
+        else:
+            # The decoder already received the holdback; "car" + "pet" is "carpet".
+            candidate = self.confirmed_pending + continuation
         if is_last:
             return SuffixUpdate(delta=candidate, pending="")
-        spans = list(iter_unit_spans(candidate))
+        else:
+            spans = list(iter_unit_spans(candidate))
         continuation_units = [candidate[start:end] for start, end in spans]
         pending_units = split_units(self.pending)
         if not pending_units:
             return SuffixUpdate(delta="", pending=candidate)
-        agreed = common_unit_prefix(pending_units, continuation_units, normalized=True)
+        else:
+            agreed = common_unit_prefix(
+                pending_units, continuation_units, normalized=True
+            )
         emit = max(0, agreed - holdback_units)
         # Leave the separator after the last emitted unit with the pending tail.
         pending_start = spans[emit - 1][1] if emit else 0
         # Keep an accepted character prefix even when new audio extends its
         # final word; that word still needs agreement before publication.
-        confirmed_end = self.confirmed_pending_chars
-        if pending_units == continuation_units:
-            confirmed_end = len(candidate)
+        confirmed_end = (
+            len(candidate)
+            if pending_units == continuation_units
+            else self.confirmed_pending_chars
+        )
         return SuffixUpdate(
             delta=candidate[:pending_start],
             pending=candidate[pending_start:],

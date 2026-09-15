@@ -237,7 +237,7 @@ class Serving(msgspec.Struct):
     ] = 32
     enable_asr_encoder_window: A[
         bool,
-        "Enable encoder-window rolling context for realtime ASR models that declare independently encodable audio windows. It activates only after the configured long-audio threshold (the adapter's default unless overridden), so raise --asr-max-buffer-seconds above that threshold. Models and languages without a declared policy stay cumulative, with inference cost growing as the item grows. The total item limit remains --asr-max-buffer-seconds in all modes. Experimental; not supported with disaggregation.",
+        "Enable encoder-window rolling context for realtime ASR models that declare independently encodable audio windows. It activates only after the configured long-audio threshold (the adapter's default unless overridden), so raise --asr-max-buffer-seconds above that threshold. Models without both a processor capability and an adapter policy stay cumulative, with inference cost growing as the item grows. The total item limit remains --asr-max-buffer-seconds in all modes. Experimental; not supported with disaggregation.",
     ] = False
     asr_encoder_window_min_audio_seconds: A[
         Optional[float],

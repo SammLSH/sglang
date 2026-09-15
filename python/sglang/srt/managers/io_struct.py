@@ -48,7 +48,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import JsonValue, PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
@@ -223,7 +223,7 @@ class GenerateReqInput:
     # Optional request-scoped keyword arguments interpreted by the multimodal
     # processor (for example windowing opt-in and leading audio context).
     # Values must be JSON-compatible; a processor validates the keys it consumes.
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None
+    mm_processor_kwargs: Optional[Dict[str, JsonValue]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.

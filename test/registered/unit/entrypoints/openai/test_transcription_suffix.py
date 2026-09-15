@@ -1,5 +1,3 @@
-"""Suffix publication and bounded decoder-prefix regressions."""
-
 import re
 import unittest
 from types import SimpleNamespace
@@ -14,14 +12,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _pending_state(update):
+def pending_state(update: SuffixUpdate) -> TranscriptionSuffixState:
     return TranscriptionSuffixState(
         pending=update.pending, confirmed_pending_chars=update.confirmed_pending_chars
     )
 
 
 class TestTranscriptionSuffixState(CustomTestCase):
-    def test_agreement_and_final_pending(self):
+    def test_agreement_and_final_pending(self) -> None:
         for pending, candidate, delta, tail in (
             ("two three four", "two three five", "two", " three five"),
             ("你好API接口", "你好API结果", "你好", "API结果"),
@@ -32,12 +30,14 @@ class TestTranscriptionSuffixState(CustomTestCase):
                 self.assertEqual(update, SuffixUpdate(delta=delta, pending=tail))
                 self.assertEqual(update.delta + update.pending, candidate)
                 self.assertEqual(state.pending, pending)
-                state = _pending_state(update)
+                state = pending_state(update)
                 update = state.reconcile("", is_last=True, holdback_units=1)
                 self.assertEqual(update, SuffixUpdate(delta=tail, pending=""))
-                self.assertEqual(_pending_state(update).flush(), "")
+                self.assertEqual(pending_state(update).flush(), "")
 
-    def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(self):
+    def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(
+        self,
+    ) -> None:
         tokenizer = SimpleNamespace(
             encode=lambda text, **kwargs: list(text),
             decode=lambda tokens, **kwargs: "".join(tokens),
@@ -45,7 +45,7 @@ class TestTranscriptionSuffixState(CustomTestCase):
         for continuation, expected in (("pet", "carpet"), (" pet", "car pet")):
             with self.subTest(continuation=continuation):
                 state = TranscriptionSuffixState(pending="car")
-                state = _pending_state(
+                state = pending_state(
                     state.reconcile("car", is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, "car")
@@ -55,22 +55,22 @@ class TestTranscriptionSuffixState(CustomTestCase):
                 self.assertEqual(
                     state.bounded_prefix(tokenizer, 2, emitted_text=""), ""
                 )
-                state = _pending_state(
+                state = pending_state(
                     state.reconcile(continuation, is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, "car")
                 self.assertEqual(state.pending, expected)
                 update = state.reconcile(continuation, is_last=False, holdback_units=1)
-                state = _pending_state(update)
+                state = pending_state(update)
                 self.assertEqual(update.delta + state.flush(), expected)
                 self.assertEqual(state.confirmed_pending_chars, 0)
         state = TranscriptionSuffixState(pending="very very")
         update = state.reconcile("very very", is_last=False, holdback_units=1)
         self.assertEqual(update.delta, "very")
-        state = _pending_state(update)
+        state = pending_state(update)
         self.assertEqual(state.flush(), " very")
 
-    def test_final_delta_and_flush_preserve_punctuation(self):
+    def test_final_delta_and_flush_preserve_punctuation(self) -> None:
         update = TranscriptionSuffixState().reconcile(
             ",  world", is_last=True, holdback_units=1
         )
@@ -80,21 +80,21 @@ class TestTranscriptionSuffixState(CustomTestCase):
         self.assertEqual(state.pending, "")
         self.assertEqual(state.flush(), "")
 
-    def test_revised_holdback_is_not_confirmed_by_normalized_agreement(self):
+    def test_revised_holdback_is_not_confirmed_by_normalized_agreement(self) -> None:
         for revised in ("Yes.", "yes?", "yesterday"):
             with self.subTest(revised=revised):
                 state = TranscriptionSuffixState(pending="yes.")
-                state = _pending_state(
+                state = pending_state(
                     state.reconcile(revised, is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, "")
                 self.assertEqual(state.pending, revised)
-                state = _pending_state(
+                state = pending_state(
                     state.reconcile(revised, is_last=False, holdback_units=1)
                 )
                 self.assertEqual(state.confirmed_pending, revised)
 
-    def test_prefix_keeps_whole_units_and_rechecks_the_token_budget(self):
+    def test_prefix_keeps_whole_units_and_rechecks_the_token_budget(self) -> None:
         char_tokenizer = SimpleNamespace(
             encode=lambda text, **kwargs: list(text),
             decode=lambda tokens, **kwargs: "".join(tokens),
@@ -120,6 +120,18 @@ class TestTranscriptionSuffixState(CustomTestCase):
         self.assertEqual(
             state.bounded_prefix(char_tokenizer, 20, emitted_text="你好"), "你好API"
         )
+        for published, pending in (
+            ("earlier " * 10_000, "last word"),
+            ("earlier ", "confirmed " * 10_000 + "last word"),
+        ):
+            with self.subTest(confirmed_chars=len(pending)):
+                state = TranscriptionSuffixState(
+                    pending=pending, confirmed_pending_chars=len(pending)
+                )
+                self.assertEqual(
+                    state.bounded_prefix(char_tokenizer, 9, emitted_text=published),
+                    "last word",
+                )
 
 
 if __name__ == "__main__":

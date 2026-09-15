@@ -14,11 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 
 class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
-    """How a realtime session may switch to encoder-window continuation.
-
-    The window config itself comes from the multimodal processor; this is
-    the adapter's declaration of when windowing is safe for its model.
-    """
+    """Model-declared activation, context and text limits for windowed ASR."""
 
     # Audio duration after which an item switches from cumulative decoding.
     min_audio_sec: float
@@ -33,12 +29,14 @@ class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
     def __post_init__(self) -> None:
         if not math.isfinite(self.min_audio_sec) or self.min_audio_sec < 0:
             raise ValueError("min_audio_sec must be finite and non-negative")
-        if self.max_audio_context_windows <= 0:
+        elif self.max_audio_context_windows <= 0:
             raise ValueError("max_audio_context_windows must be positive")
-        if self.decoder_prefix_max_tokens <= 0:
+        elif self.decoder_prefix_max_tokens <= 0:
             raise ValueError("decoder_prefix_max_tokens must be positive")
-        if self.decoder_prefix_holdback_units < 0:
+        elif self.decoder_prefix_holdback_units < 0:
             raise ValueError("decoder_prefix_holdback_units must be non-negative")
+        else:
+            return
 
 
 class TranscriptionAdapter(ABC):
@@ -151,18 +149,14 @@ class TranscriptionAdapter(ABC):
 
     @property
     def realtime_encoder_window_policy(self) -> Optional[RealtimeEncoderWindowPolicy]:
-        """Long-audio encoder-window policy, or None when the model has none."""
+        """Return windowed ASR settings, or None if the model does not support it."""
         return None
 
     def postprocess_streaming_text(
         self, text: str, *, continuation: bool = False
     ) -> Optional[str]:
-        """Return the visible part of a partial decoder snapshot.
-
-        ``None`` means a model-specific prefix is still incomplete and the
-        caller should keep buffering. ``continuation`` says the prompt already
-        ended with transcript text the model is extending, so no such prefix
-        is expected. Defaults to ``postprocess_text``.
+        """Extract partial transcript text; return None while markers are incomplete.
+        With continuation=True, the prompt already ends in transcript text.
         """
         return self.postprocess_text(text)
 

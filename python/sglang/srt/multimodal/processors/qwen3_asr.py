@@ -11,7 +11,6 @@ from sglang.srt.multimodal.encoder_window import (
     EncoderWindowSpec,
 )
 from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 
@@ -24,7 +23,7 @@ DEFAULT_ASR_PROMPT = (
 )
 
 
-class Qwen3ASRMultimodalProcessor(EncoderWindowMixin, BaseMultimodalProcessor):
+class Qwen3ASRMultimodalProcessor(EncoderWindowMixin):
     models = [Qwen3ASRForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):

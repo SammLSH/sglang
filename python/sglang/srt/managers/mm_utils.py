@@ -369,21 +369,25 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 def concat_padded_audio_features(
     items: List[MultimodalDataItem], *, mask_key: str = "feature_attention_mask"
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Batch audio rows with different frame counts, padding features and masks.
-
-    Features have shape (batch, n_mels, frames). Preserve item and row order;
-    return a mask only when every item supplies one, matching the model's
-    existing mask handling.
-    """
-    features = nn.utils.rnn.pad_sequence(
-        [feature.T for item in items for feature in item.feature], batch_first=True
-    ).permute(0, 2, 1)
-    masks = [getattr(item, mask_key, None) for item in items]
-    if any(mask is None for mask in masks):
-        return features, None
-    return features, nn.utils.rnn.pad_sequence(
-        [row for mask in masks for row in mask], batch_first=True
-    )
+    """Batch (batch, n_mels, frames) features, padding only unequal widths."""
+    masks = [item.model_specific_data.get(mask_key) for item in items]
+    if len(items) == 1:
+        return items[0].feature, masks[0]
+    elif all(item.feature.shape[-1] == items[0].feature.shape[-1] for item in items):
+        features = torch.cat([item.feature for item in items])
+        mask = torch.cat(masks) if all(mask is not None for mask in masks) else None
+    else:
+        features = nn.utils.rnn.pad_sequence(
+            [feature.T for item in items for feature in item.feature], batch_first=True
+        ).permute(0, 2, 1)
+        mask = (
+            nn.utils.rnn.pad_sequence(
+                [row for mask in masks for row in mask], batch_first=True
+            )
+            if all(mask is not None for mask in masks)
+            else None
+        )
+    return features, mask
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus

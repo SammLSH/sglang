@@ -1,13 +1,13 @@
-"""Focused transcript publication and backend iterator regressions."""
-
 # ruff: noqa: E402 -- CPU kernel stubs must precede runtime imports.
 
 import asyncio
 import unittest
 from types import SimpleNamespace
+from typing import AsyncIterator, Optional
 from unittest.mock import AsyncMock, patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from pydantic import JsonValue
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     apply_cumulative_transcript,
     generate_transcript,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,7 +27,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestCumulativeTranscriptState(CustomTestCase):
-    def test_holdback_and_revision_without_prefix(self):
+    def test_holdback_and_revision_without_prefix(self) -> None:
         state = StreamingASRState(2.0, 2, 1)
         emitted_text = ""
         delta = state.update("one two three", emitted_text=emitted_text)
@@ -60,7 +61,7 @@ class TestCumulativeTranscriptState(CustomTestCase):
                 emitted_text += state.finalize(emitted_text=emitted_text)
                 self.assertEqual(emitted_text, extended)
 
-    def test_punctuation_remainder_does_not_repeat_the_published_word(self):
+    def test_punctuation_remainder_does_not_repeat_the_published_word(self) -> None:
         state = StreamingASRState(2.0, 2, 1)
         delta = state.update("Hello pending", emitted_text="")
         self.assertEqual(delta, "Hello")
@@ -80,7 +81,7 @@ class TestCumulativeTranscriptState(CustomTestCase):
             "fold three",
         )
 
-    def test_repetition_after_prefix_advances_and_an_empty_continuation(self):
+    def test_repetition_after_prefix_advances_and_an_empty_continuation(self) -> None:
         state = StreamingASRState(2.0, 2, 5)
         emitted_text = ""
         phrase = "one two three four five six"
@@ -102,15 +103,18 @@ class TestCumulativeTranscriptState(CustomTestCase):
 
 
 class TestTranscriptionBackendContract(CustomTestCase):
-    def test_abort_normalization_and_iterator_cleanup(self):
-        async def run():
+    def test_abort_normalization_and_iterator_cleanup(self) -> None:
+        async def _run() -> None:
             closed = []
 
-            async def responses(request, raw_request):
+            async def _responses(
+                request: GenerateReqInput, raw_request: Optional[Request]
+            ) -> AsyncIterator[dict[str, JsonValue]]:
                 try:
                     if isinstance(frame, Exception):
                         raise frame
-                    yield frame
+                    else:
+                        yield frame
                     self.fail("non-stream read continued after its response")
                 finally:
                     closed.append(True)
@@ -120,7 +124,7 @@ class TestTranscriptionBackendContract(CustomTestCase):
                 postprocess_text=lambda text: text,
                 postprocess_streaming_text=lambda text, **kwargs: text,
             )
-            manager = SimpleNamespace(generate_request=responses)
+            manager = SimpleNamespace(generate_request=_responses)
             frame = {"text": "hello", "meta_info": {"finish_reason": {"type": "stop"}}}
             result = await generate_transcript(manager, adapter, bytes(4), {})
             self.assertEqual(
@@ -164,7 +168,7 @@ class TestTranscriptionBackendContract(CustomTestCase):
             "sglang.srt.entrypoints.openai.streaming_asr.get_serving",
             return_value=SimpleNamespace(incremental_streaming_output=False),
         ):
-            asyncio.run(run())
+            asyncio.run(_run())
 
 
 if __name__ == "__main__":
