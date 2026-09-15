@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from copy import copy
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from msgspec.structs import replace
 
@@ -12,7 +12,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer imp
     snapshot_samples,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mode import (
-    TranscriptCandidateCallback,
     TranscriptionMode,
     TranscriptionOutcome,
     TranscriptionStep,
@@ -24,7 +23,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_st
 from sglang.srt.entrypoints.openai.streaming_asr import (
     apply_cumulative_transcript,
     generate_transcript,
-    iter_unit_spans,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +59,6 @@ class CumulativeMode(TranscriptionMode):
         step: TranscriptionStep,
         *,
         sampling_params: Dict[str, Any],
-        on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Reconcile complete hypotheses against the request's published prefix."""
         before = step.mode_state
@@ -72,23 +69,6 @@ class CumulativeMode(TranscriptionMode):
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
 
-        async def publish_snapshot(text: str) -> None:
-            assert on_candidate is not None
-            # The final unit may still be incomplete. Slice the original text
-            # so mixed-language boundaries match the final candidate exactly.
-            full = decoder_prefix + text
-            spans = list(iter_unit_spans(full))
-            snapshot = full[: spans[-2][1]] if len(spans) > 1 else ""
-            if not snapshot or not snapshot.startswith(decoder_prefix):
-                return
-            candidate = apply_cumulative_transcript(
-                copy(transcript_before),
-                snapshot,
-                is_last=False,
-                emitted_text=step.emitted_text,
-            )
-            await on_candidate(candidate)
-
         generation = await generate_transcript(
             tokenizer_manager=self.tokenizer_manager,
             adapter=self.adapter,
@@ -96,7 +76,6 @@ class CumulativeMode(TranscriptionMode):
             audio_data=samples,
             sampling_params=sampling_params,
             routed_dp_rank=self.routed_dp_rank,
-            on_update=publish_snapshot if on_candidate is not None else None,
         )
         if generation is None:
             if step.is_last:

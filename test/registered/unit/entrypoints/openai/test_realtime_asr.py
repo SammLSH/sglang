@@ -58,6 +58,7 @@ class _Backend:
         self.cleaned = asyncio.Event()
 
     async def generate_request(self, request, raw_request=None, **kwargs):
+        assert not request.stream
         self.requests.append(request)
         if self.blocked:
             self.started.set()
@@ -99,15 +100,13 @@ def _policy(threshold):
     )
 
 
-def _connection(scripts, *, window=False, streaming=False, threshold=0, blocked=False):
-    get_context().override("realtime_asr_test", enable_asr_decoder_streaming=streaming)
+def _connection(scripts, *, window=False, threshold=0, blocked=False):
     manager = _Backend(scripts, blocked=blocked)
     adapter = SimpleNamespace(
         prompt_template="PROMPT:",
         model_sample_rate=1,
         supports_chunked_streaming=True,
         postprocess_text=lambda text: text,
-        postprocess_streaming_text=lambda text, continuation=False: text,
         chunked_streaming_config={
             "chunk_size_sec": 2.0,
             "unfixed_chunk_num": 2,
@@ -178,8 +177,6 @@ class TestRealtimeASR(CustomTestCase):
             self,
             get_context().override_server_args(
                 asr_max_buffer_seconds=120,
-                enable_asr_decoder_streaming=False,
-                incremental_streaming_output=False,
             ),
         )
 
@@ -263,14 +260,14 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(len(manager.requests), requests_before_commit + 1)
         self.assertEqual(_transcript(connection), (spoken, [spoken]))
 
-    def test_publication_uses_one_snapshot_through_preview_final_and_flush(self):
+    def test_completed_chunks_and_flush_preserve_exact_text(self):
         scripts = [
             ["one two three four"],
             ["one two three four"],
-            [" five six seven", " five six seven eight"],
-            [" five six seven eight nine", " five six seven eight nine ten"],
+            [" five six seven eight"],
+            [" five six seven eight nine ten"],
         ]
-        manager, connection = _connection(scripts, window=True, streaming=True)
+        manager, connection = _connection(scripts, window=True)
         for _ in scripts:
             self.assertFalse(_append(connection, bytes(4)))
             self.assertEqual(
@@ -282,17 +279,19 @@ class TestRealtimeASR(CustomTestCase):
         expected = "one two three four five six seven eight nine ten"
         self.assertEqual(_transcript(connection), (expected, [expected]))
 
-        # Cumulative CJK previews and their final append retain mixed-script
-        # boundaries through the same publication and flush path.
+        # Completed cumulative chunks retain mixed-script boundaries through
+        # publication and flush.
         expected = "现在使用API接口继续输出"
-        _, connection = _connection([["现在使用API接口", expected]], streaming=True)
+        _, connection = _connection([[expected]])
         self.assertFalse(_append(connection, bytes(4)))
-        self.assertEqual(_events(connection, ".delta")[0]["delta"], "现在使用API")
+        self.assertEqual(
+            _events(connection, ".delta")[0]["delta"], "现在使用API接口继续输"
+        )
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
         self.assertEqual(_transcript(connection), (expected, [expected]))
 
         scripts = [["你好API接口"], ["你好API接口"], ["继续输出"], ["继续输出"]]
-        manager, connection = _connection(scripts, window=True, streaming=True)
+        manager, connection = _connection(scripts, window=True)
         for _ in scripts:
             self.assertFalse(_append(connection, bytes(4)))
         self.assertEqual(manager.requests[-1].text, "PROMPT:你好API接口")
@@ -301,24 +300,20 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(_transcript(connection), (expected, [expected]))
 
     def test_failed_send_records_only_successfully_published_text(self):
-        _, connection = _connection(
-            [["one two three", "one two three four"]], streaming=True
-        )
+        _, connection = _connection([["one two three four"]])
         mode_before = deepcopy(connection.transcription_state.mode_state)
         delivered = []
 
         async def send(text):
             event = json.loads(text)
             if event["type"].endswith(".delta"):
-                if delivered:
-                    raise RuntimeError("peer disconnected during publication")
-                delivered.append(event["delta"])
+                raise RuntimeError("peer disconnected during publication")
 
         connection.websocket.send_text.side_effect = send
         with self.assertLogs(level="ERROR"):
             self.assertTrue(_append(connection, bytes(4)))
         state = connection.transcription_state
-        self.assertEqual(state.emitted_text, "one")
+        self.assertEqual(state.emitted_text, "")
         self.assertEqual(state.emitted_text, "".join(delivered))
         self.assertEqual(state.mode_state, mode_before)
         self.assertEqual(state.audio.last_processed_offset_bytes, 0)
@@ -349,10 +344,9 @@ class TestRealtimeASR(CustomTestCase):
         manager, connection = _connection(
             [
                 [("truncated words", {"type": "length"})],
-                [" one two three four", " one two three four five six"],
+                [" one two three four five six"],
             ],
             window=True,
-            streaming=True,
         )
         _activate(connection, pending=" one two three four five")
         state = connection.transcription_state

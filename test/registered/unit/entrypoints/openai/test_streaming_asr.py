@@ -5,7 +5,6 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
@@ -118,7 +117,6 @@ class TestTranscriptionBackendContract(CustomTestCase):
             adapter = SimpleNamespace(
                 prompt_template="PROMPT:",
                 postprocess_text=lambda text: text,
-                postprocess_streaming_text=lambda text, **kwargs: text,
             )
             manager = SimpleNamespace(generate_request=responses)
             frame = {"text": "hello", "meta_info": {"finish_reason": {"type": "stop"}}}
@@ -126,7 +124,6 @@ class TestTranscriptionBackendContract(CustomTestCase):
             self.assertEqual(
                 (result.text, result.finish_reason, closed), ("hello", "stop", [True])
             )
-            callback_error = HTTPException(503, "callback failed")
             abort = {
                 "meta_info": {
                     "finish_reason": {
@@ -136,35 +133,14 @@ class TestTranscriptionBackendContract(CustomTestCase):
                     }
                 }
             }
-            for frame, callback, expected in (
-                (
-                    HTTPException(503, "backend failed"),
-                    None,
-                    TranscriptionBackendAborted,
-                ),
-                (abort, AsyncMock(), TranscriptionBackendAborted),
-                (
-                    {"text": "hello"},
-                    AsyncMock(side_effect=callback_error),
-                    HTTPException,
-                ),
-            ):
+            for frame in (HTTPException(503, "backend failed"), abort):
                 closed.clear()
-                with self.assertRaises(expected) as caught:
-                    await generate_transcript(
-                        manager, adapter, bytes(4), {}, on_update=callback
-                    )
+                with self.assertRaises(TranscriptionBackendAborted) as caught:
+                    await generate_transcript(manager, adapter, bytes(4), {})
                 self.assertEqual(closed, [True])
-                if expected is TranscriptionBackendAborted:
-                    self.assertTrue(caught.exception.retryable)
-                else:
-                    self.assertIs(caught.exception, callback_error)
+                self.assertTrue(caught.exception.retryable)
 
-        with patch(
-            "sglang.srt.entrypoints.openai.streaming_asr.get_serving",
-            return_value=SimpleNamespace(incremental_streaming_output=False),
-        ):
-            asyncio.run(run())
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionUsage,
@@ -67,17 +65,6 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
         if self.ASR_TEXT_TAG in text:
             return text.split(self.ASR_TEXT_TAG, 1)[-1]
         return text
-
-    def postprocess_streaming_text(
-        self, text: str, *, continuation: bool = False
-    ) -> Optional[str]:
-        # The forced "language xx<asr_text>" prefix may span several decoder
-        # updates; nothing before the delimiter is transcript text. A prompt
-        # that already ends with transcript text is continued without the
-        # prefix, so waiting for the delimiter would hide every snapshot.
-        if not continuation and self.ASR_TEXT_TAG not in text:
-            return None
-        return self.postprocess_text(text)
 
     def build_verbose_response(
         self,

@@ -154,18 +154,6 @@ class TranscriptionAdapter(ABC):
         """Long-audio encoder-window policy, or None when the model has none."""
         return None
 
-    def postprocess_streaming_text(
-        self, text: str, *, continuation: bool = False
-    ) -> Optional[str]:
-        """Return the visible part of a partial decoder snapshot.
-
-        ``None`` means a model-specific prefix is still incomplete and the
-        caller should keep buffering. ``continuation`` says the prompt already
-        ended with transcript text the model is extending, so no such prefix
-        is expected. Defaults to ``postprocess_text``.
-        """
-        return self.postprocess_text(text)
-
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.
 

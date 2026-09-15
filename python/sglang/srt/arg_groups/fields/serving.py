@@ -255,10 +255,6 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Override the number of agreed text units held back in encoder-window realtime ASR (words for English). Must be non-negative; 0 disables the extra holdback. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
     ] = None
-    enable_asr_decoder_streaming: A[
-        bool,
-        "Publish append-safe realtime transcription deltas while a backend ASR decode is still running (each backend request streams). Independent of --enable-asr-encoder-window. Experimental.",
-    ] = False
     preferred_sampling_params: A[
         Optional[str],
         Arg(

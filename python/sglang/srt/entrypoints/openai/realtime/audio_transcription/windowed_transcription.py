@@ -22,7 +22,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer imp
     snapshot_samples,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mode import (
-    TranscriptCandidateCallback,
     TranscriptionMode,
     TranscriptionOutcome,
     TranscriptionStep,
@@ -38,7 +37,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_su
 from sglang.srt.entrypoints.openai.streaming_asr import (
     TranscriptionBackendAborted,
     generate_transcript,
-    iter_unit_spans,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     RealtimeEncoderWindowPolicy,
@@ -223,7 +221,6 @@ class EncoderWindowMode(TranscriptionMode):
         step: TranscriptionStep,
         *,
         sampling_params: Dict[str, Any],
-        on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Decode and reconcile without modifying the step's accepted text state."""
         before = step.mode_state
@@ -240,20 +237,6 @@ class EncoderWindowMode(TranscriptionMode):
             step.end_offset_bytes,
         )
 
-        async def publish_snapshot(text: str) -> None:
-            assert on_candidate is not None
-            spans = list(iter_unit_spans(text))
-            if len(spans) < 2:
-                return
-            # Hold the incomplete last unit, preserving the candidate's spacing.
-            snapshot = text[: spans[-2][1]]
-            candidate = suffix_before.reconcile(
-                snapshot,
-                is_last=step.is_last,
-                holdback_units=self.encoder_window.policy.decoder_prefix_holdback_units,
-            ).delta
-            await on_candidate(candidate)
-
         try:
             generation = await generate_transcript(
                 tokenizer_manager=self.tokenizer_manager,
@@ -266,31 +249,27 @@ class EncoderWindowMode(TranscriptionMode):
                     // PCM_SAMPLE_WIDTH_BYTES,
                 ),
                 routed_dp_rank=self.routed_dp_rank,
-                on_update=publish_snapshot if on_candidate is not None else None,
             )
         except TranscriptionBackendAborted as error:
-            return self._failed_outcome(state, step, error)
+            return self._failed_outcome(step, error)
         if generation is None:
             return self._failed_outcome(
-                state, step, RuntimeError("realtime ASR request returned no response")
+                step, RuntimeError("realtime ASR request returned no response")
             )
         if generation.finish_reason == "length":
             return self._failed_outcome(
-                state, step, RuntimeError("realtime ASR decode reached max_new_tokens")
+                step, RuntimeError("realtime ASR decode reached max_new_tokens")
             )
         return self._reconcile_encoder_window_text(step, suffix_before, generation.text)
 
     def _failed_outcome(
         self,
-        state: RealtimeTranscriptionState,
         step: TranscriptionStep,
         error: RuntimeError,
     ) -> TranscriptionOutcome:
-        """Retry before publication, disable failed handoff, or fail an active mode."""
-        if (
-            step.is_last
-            or state.emitted_text != step.emitted_text
-            or (isinstance(error, TranscriptionBackendAborted) and not error.retryable)
+        """Retry a backend failure, disable failed handoff, or fail an active mode."""
+        if step.is_last or (
+            isinstance(error, TranscriptionBackendAborted) and not error.retryable
         ):
             raise error
         logger.warning(

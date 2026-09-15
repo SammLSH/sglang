@@ -157,18 +157,12 @@ class TestPrepareServerArgs(CustomTestCase):
         options = ["--model-path", "dummy"]
         for name, value in overrides.items():
             options.extend(("--" + name.replace("_", "-"), str(value)))
-        for enabled, disabled in (
-            ("enable_asr_encoder_window", "enable_asr_decoder_streaming"),
-            ("enable_asr_decoder_streaming", "enable_asr_encoder_window"),
-        ):
-            with self.subTest(enabled=enabled):
-                args = prepare_server_args(options + ["--" + enabled.replace("_", "-")])
-                args.resolve_once()
-                serving_hook.handle_asr_validation(args)
-                self.assertTrue(resolution_result(args, enabled))
-                self.assertFalse(resolution_result(args, disabled))
-                for name, value in overrides.items():
-                    self.assertEqual(resolution_result(args, name), value)
+        args = prepare_server_args(options + ["--enable-asr-encoder-window"])
+        args.resolve_once()
+        serving_hook.handle_asr_validation(args)
+        self.assertTrue(resolution_result(args, "enable_asr_encoder_window"))
+        for name, value in overrides.items():
+            self.assertEqual(resolution_result(args, name), value)
 
         # Dummy model resolution skips this hook, so exercise rejection directly.
         invalid = prepare_server_args(

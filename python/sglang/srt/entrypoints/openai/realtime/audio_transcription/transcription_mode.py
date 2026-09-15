@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 import msgspec
 
@@ -16,18 +16,13 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-# Receives an exact append to TranscriptionStep.emitted_text, including boundary
-# spaces. Later candidates may include text already sent by earlier previews.
-TranscriptCandidateCallback = Callable[[str], Awaitable[None]]
-
 
 class TranscriptionStep(msgspec.Struct, frozen=True):
     """Request and candidate baseline fixed before generation awaits.
 
     The session's single consumer keeps mode_state unchanged during a step.
     Modes read this accepted state and copy mutable text state before updates.
-    Published text and audio cursors are snapshots, so intermediate sends
-    cannot change the reconciliation baseline of this request.
+    Published text and audio cursors fix the reconciliation baseline.
     """
 
     is_last: bool
@@ -54,7 +49,6 @@ class TranscriptionOutcome(msgspec.Struct, frozen=True):
     next_mode_state: ModeState
     audio_covered: bool
     # Exact append to the step's published baseline (or the flush baseline).
-    # The publisher sends only the portion not already emitted by previews.
     delta: str = ""
     discard_before_bytes: int | None = None
 
@@ -91,7 +85,6 @@ class TranscriptionMode(ABC):
         step: TranscriptionStep,
         *,
         sampling_params: Dict[str, Any],
-        on_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Compute candidates and return proposed changes for the caller to commit."""
         ...

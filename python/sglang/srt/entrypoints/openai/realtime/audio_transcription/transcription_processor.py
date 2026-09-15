@@ -75,7 +75,6 @@ class RealtimeTranscriptionProcessor:
         self.max_buffer_bytes = (
             get_serving().asr_max_buffer_seconds * pcm_bytes_per_second
         )
-        self.decoder_streaming = bool(get_serving().enable_asr_decoder_streaming)
 
         activation_threshold_bytes: Optional[int] = None
         routed_dp_rank: Optional[int] = None
@@ -144,28 +143,15 @@ class RealtimeTranscriptionProcessor:
             state, end_offset_bytes=end_offset_bytes, is_last=is_last
         )
 
-        async def publish_candidate(candidate: str) -> None:
-            await self._publish_candidate(
-                state,
-                candidate,
-                emitted_text_before=step.emitted_text,
-                on_transcript_delta=on_transcript_delta,
-            )
-
         outcome = await mode.execute_step(
             state,
             step,
             sampling_params=sampling_params,
-            on_candidate=(
-                publish_candidate if self.decoder_streaming and not is_last else None
-            ),
         )
         await self._publish_candidate(
             state,
             outcome.delta,
-            emitted_text_before=step.emitted_text,
             on_transcript_delta=on_transcript_delta,
-            conflict_error="completed ASR decode revised already streamed text",
         )
         self._commit_outcome(state, step, outcome)
 
@@ -175,15 +161,12 @@ class RealtimeTranscriptionProcessor:
         on_transcript_delta: TranscriptDeltaCallback,
     ) -> None:
         """Publish held text and accept its state without advancing audio."""
-        emitted_text_before = state.emitted_text
         mode = self._active_mode(state)
         outcome = mode.flush_pending(state)
         await self._publish_candidate(
             state,
             outcome.delta,
-            emitted_text_before=emitted_text_before,
             on_transcript_delta=on_transcript_delta,
-            conflict_error="ASR flush revised already published text",
         )
         self._commit_outcome(state, None, outcome)
 
@@ -192,24 +175,12 @@ class RealtimeTranscriptionProcessor:
         state: RealtimeTranscriptionState,
         candidate: str,
         *,
-        emitted_text_before: str,
         on_transcript_delta: TranscriptDeltaCallback,
-        conflict_error: Optional[str] = None,
     ) -> None:
-        """Send the candidate's unsent suffix and record successful publication.
-
-        Intermediate revisions are skipped. Final candidates supply
-        conflict_error so revisions fail before state or audio is committed.
-        """
-        full = emitted_text_before + candidate
-        if not full.startswith(state.emitted_text):
-            if conflict_error is not None:
-                raise RuntimeError(conflict_error)
-            return
-        delta = full[len(state.emitted_text) :]
-        if delta:
-            await on_transcript_delta(delta)
-            state.emitted_text += delta
+        """Publish the completed candidate before committing text or audio state."""
+        if candidate:
+            await on_transcript_delta(candidate)
+            state.emitted_text += candidate
 
     def _active_mode(self, state: RealtimeTranscriptionState) -> TranscriptionMode:
         if state.encoder_window_active:

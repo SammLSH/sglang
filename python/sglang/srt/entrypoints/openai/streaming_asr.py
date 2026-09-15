@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
     Any,
-    Awaitable,
-    Callable,
     Dict,
     Iterator,
     List,
@@ -28,7 +26,6 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.runtime_context import get_serving
 
 logger = logging.getLogger(__name__)
 
@@ -311,32 +308,19 @@ async def generate_transcript(
     routing_key: Optional[str] = None,
     mm_processor_kwargs: Optional[Dict[str, Any]] = None,
     routed_dp_rank: Optional[int] = None,
-    on_update: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Optional[GeneratedTranscript]:
-    """Run one backend request and return its normalized transcript.
-
-    With ``on_update`` the backend request streams, and every partial decoder
-    snapshot the adapter deems visible is passed to the callback as
-    normalized cumulative text before the final result is returned.
-    ``decoder_prefix`` is transcript text appended to the adapter's prompt
-    for the model to continue; its snapshots are not held back
-    waiting for a leading marker the continuation never carries.
-    Results and snapshots contain only generated text, excluding that prefix.
-    """
-    stream = on_update is not None
+    """Run a completed backend request, returning text without decoder_prefix."""
     chunk_request = GenerateReqInput(
         text=adapter.prompt_template + decoder_prefix,
         audio_data=audio_data,
         sampling_params=sampling_params,
-        stream=stream,
+        stream=False,
         modalities=["audio"],
         routing_key=routing_key,
         mm_processor_kwargs=mm_processor_kwargs,
         routed_dp_rank=routed_dp_rank,
     )
 
-    cumulative_text = ""
-    incremental = stream and bool(get_serving().incremental_streaming_output)
     ret = None
     async with aclosing(
         tokenizer_manager.generate_request(chunk_request, raw_request)
@@ -347,9 +331,7 @@ async def generate_transcript(
             except StopAsyncIteration:
                 break
             except HTTPException as error:
-                # Non-stream scheduler errors are raised by the manager;
-                # stream errors arrive as terminal frames below. Normalize
-                # only backend reads, never errors from the update callback.
+                # Normalize scheduler errors for the caller's recovery policy.
                 if error.status_code not in (
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -359,27 +341,13 @@ async def generate_transcript(
                     str(error.detail), status_code=error.status_code
                 ) from error
             _raise_for_aborted_response(ret)
-            if not stream:
-                break
-            chunk_text = ret.get("text") or ""
-            cumulative_text = (
-                cumulative_text + chunk_text if incremental else chunk_text
-            )
-            if _finish_reason_type(ret) == "length":
-                # Let the caller handle truncation before this terminal frame
-                # publishes anything that would make a retry unsafe.
-                continue
-            visible_text = adapter.postprocess_streaming_text(
-                cumulative_text, continuation=bool(decoder_prefix)
-            )
-            if visible_text is not None:
-                await on_update(normalize_whitespace(visible_text))
+            break
 
     if ret is None:
         logger.warning("[streaming_asr] ASR request returned no response")
         return None
 
-    raw_text = cumulative_text if stream else (ret.get("text") or "")
+    raw_text = ret.get("text") or ""
     return GeneratedTranscript(
         text=normalize_whitespace(adapter.postprocess_text(raw_text)),
         finish_reason=_finish_reason_type(ret),
