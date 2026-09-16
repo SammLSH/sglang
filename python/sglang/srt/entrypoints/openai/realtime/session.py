@@ -546,10 +546,13 @@ class RealtimeConnection:
                 self.config.input_sample_rate,
                 self.model_sample_rate,
             )
-        self.transcription_state.audio.data.extend(data)
+        audio = self.transcription_state.audio
+        audio.data.extend(data)
         # One append can contain several audio chunks that need separate requests.
-        while self.transcription_processor.is_audio_chunk_ready(
-            self.transcription_state
+        # Use attempted progress so a retry waits for another full chunk.
+        while (
+            audio.received_bytes - audio.last_attempted_offset_bytes
+            >= self.transcription_processor.mode.chunk_size_bytes
         ):
             ok = await self._run_inference(is_last=False)
             if not ok:

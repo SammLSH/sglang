@@ -77,7 +77,7 @@ class TestCumulativeTranscriptState(CustomTestCase):
         state = StreamingASRState(2.0, 2, 1)
         state.full_transcript = "one twofold three"
         self.assertEqual(
-            state.get_pending_transcript(emitted_text="one two"),
+            state.finalize(emitted_text="one two"),
             "fold three",
         )
 

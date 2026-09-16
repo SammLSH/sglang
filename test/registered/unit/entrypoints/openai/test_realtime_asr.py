@@ -24,9 +24,6 @@ import numpy as np
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
     WindowedTranscriptionState,
 )
-from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
-    TranscriptionSuffixState,
-)
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     ResolvedEncoderWindowPolicy,
 )
@@ -178,13 +175,13 @@ def append_audio(connection: RealtimeConnection, pcm: bytes) -> bool:
     )
 
 
-def activate_windowed_transcription(
+def seed_windowed_transcript(
     connection: RealtimeConnection, pending_text: str = " four five six"
 ) -> None:
     connection.transcription_state.emitted_text = "one two three"
-    connection.transcription_state.mode_state = WindowedTranscriptionState(
-        suffix=TranscriptionSuffixState(pending_text=pending_text)
-    )
+    state = connection.transcription_state.mode_state
+    assert isinstance(state, WindowedTranscriptionState)
+    state.suffix.pending_text = pending_text
 
 
 def events_of_type(
@@ -218,7 +215,7 @@ class TestRealtimeASR(CustomTestCase):
 
     def test_final_failure_never_emits_completed(self) -> None:
         _, connection = make_connection([[""], [""]], window=True)
-        activate_windowed_transcription(connection)
+        seed_windowed_transcript(connection)
         connection.transcription_state.audio.data.extend(bytes(4))
         run_transcription_request(connection)
         connection.transcription_state.audio.data.extend(bytes(2))
@@ -247,7 +244,7 @@ class TestRealtimeASR(CustomTestCase):
             window=True,
             streaming=streaming,
         )
-        activate_windowed_transcription(connection)
+        seed_windowed_transcript(connection)
         run_async(connection._emit_transcription_delta("one two three"))
         state = connection.transcription_state
         state.audio.data.extend(np.arange(58, dtype=np.int16).tobytes())
@@ -273,7 +270,7 @@ class TestRealtimeASR(CustomTestCase):
                     end * 2,
                 )
                 self.assertEqual(state.audio.base_offset_bytes, (start - context) * 2)
-                self.assertTrue(state.encoder_window_active)
+                self.assertIsInstance(state.mode_state, WindowedTranscriptionState)
                 expected_kwargs = {
                     "encoder_window": {"leading_context_samples": context}
                 }
@@ -321,7 +318,9 @@ class TestRealtimeASR(CustomTestCase):
             [" five six seven eight nine", " five six seven eight nine ten"],
         ]
         manager, connection = make_connection(scripts, window=True, streaming=True)
-        self.assertTrue(connection.transcription_state.encoder_window_active)
+        self.assertIsInstance(
+            connection.transcription_state.mode_state, WindowedTranscriptionState
+        )
         for _ in scripts:
             self.assertFalse(append_audio(connection, bytes(4)))
             self.assertEqual(
@@ -422,7 +421,7 @@ class TestRealtimeASR(CustomTestCase):
                 self.assertFalse(
                     append_audio(
                         connection,
-                        bytes(connection.transcription_processor.chunk_size_bytes),
+                        bytes(connection.transcription_processor.mode.chunk_size_bytes),
                     )
                 )
                 self.assertEqual(finished_at_send[0], not streaming)
@@ -469,9 +468,7 @@ class TestRealtimeASR(CustomTestCase):
             window=True,
             streaming=True,
         )
-        activate_windowed_transcription(
-            connection, pending_text=" one two three four five"
-        )
+        seed_windowed_transcript(connection, pending_text=" one two three four five")
         state = connection.transcription_state
         original_pcm = np.array([1, 2], dtype=np.int16).tobytes()
         state.audio.data.extend(original_pcm)
@@ -509,7 +506,7 @@ class TestRealtimeASR(CustomTestCase):
             window=True,
             streaming=True,
         )
-        activate_windowed_transcription(connection)
+        seed_windowed_transcript(connection)
         state = connection.transcription_state
         accepted = state.mode_state
         state.audio.data.extend(original_pcm)

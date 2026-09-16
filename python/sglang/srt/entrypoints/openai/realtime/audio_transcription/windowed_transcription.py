@@ -75,24 +75,36 @@ class WindowedTranscriptionMode(TranscriptionMode):
         super().__init__(tokenizer_manager, adapter)
         self.encoder_window = encoder_window
         self.unfixed_text_units = int(
-            adapter.chunked_streaming_config["unfixed_token_num"]
+            self.chunked_streaming_config["unfixed_token_num"]
         )
         # Retain the context, mutable tail, and one extra window for retries.
         self.max_retained_audio_bytes = (
             encoder_window.policy.max_audio_context_windows + 2
         ) * encoder_window.window_bytes
 
+    def create_state(self) -> WindowedTranscriptionState:
+        return WindowedTranscriptionState(suffix=TranscriptionSuffixState())
+
     def build_transcription_request(
         self,
         state: RealtimeTranscriptionState,
         *,
-        end_offset_bytes: int,
         is_last: bool,
     ) -> TranscriptionRequest:
         """Select the audio range and decoder text for windowed transcription."""
         mode_state = state.mode_state
         assert isinstance(mode_state, WindowedTranscriptionState)
         suffix_state = mode_state.suffix
+        # Bound each window request even when one append contains many chunks.
+        audio = state.audio
+        end_offset_bytes = (
+            audio.received_bytes
+            if is_last
+            else min(
+                audio.received_bytes,
+                audio.last_attempted_offset_bytes + self.chunk_size_bytes,
+            )
+        )
         start_offset_bytes = self.get_audio_start_offset_bytes(state, end_offset_bytes)
         decoder_prefix = suffix_state.build_decoder_prefix(
             self.tokenizer_manager.tokenizer,
@@ -110,13 +122,13 @@ class WindowedTranscriptionMode(TranscriptionMode):
                 is_last=is_last,
                 start_offset_bytes=start_offset_bytes,
                 end_offset_bytes=end_offset_bytes,
-                last_attempted_offset_bytes=state.audio.last_attempted_offset_bytes,
-                last_processed_offset_bytes=state.audio.last_processed_offset_bytes,
+                last_attempted_offset_bytes=audio.last_attempted_offset_bytes,
+                last_processed_offset_bytes=audio.last_processed_offset_bytes,
                 emitted_text=state.emitted_text,
                 mode_state=mode_state,
                 leading_context_bytes=min(
                     self.encoder_window.leading_context_bytes,
-                    start_offset_bytes - state.audio.base_offset_bytes,
+                    start_offset_bytes - audio.base_offset_bytes,
                 ),
                 decoder_prefix=decoder_prefix,
             )
@@ -234,7 +246,7 @@ class WindowedTranscriptionMode(TranscriptionMode):
             )
         else:
             return self.prepare_transcription_outcome(
-                request, previous_suffix_state, generated_transcript.text
+                request, generated_transcript.text
             )
 
     def handle_transcription_failure(
@@ -272,10 +284,12 @@ class WindowedTranscriptionMode(TranscriptionMode):
     def prepare_transcription_outcome(
         self,
         request: TranscriptionRequest,
-        suffix_state: TranscriptionSuffixState,
         text: str,
     ) -> TranscriptionOutcome:
         """Decide which text can be sent and which audio needs another transcription."""
+        previous_mode_state = request.mode_state
+        assert isinstance(previous_mode_state, WindowedTranscriptionState)
+        suffix_state = previous_mode_state.suffix
         update = suffix_state.prepare_transcript_update(
             text,
             is_last=request.is_last,
@@ -290,10 +304,7 @@ class WindowedTranscriptionMode(TranscriptionMode):
             and not text
         ):
             raise RuntimeError("final realtime ASR recovery returned empty text")
-        else:
-            previous_mode_state = request.mode_state
-        assert isinstance(previous_mode_state, WindowedTranscriptionState)
-        if (
+        elif (
             update.empty_generated_text
             and not request.is_last
             and request.end_offset_bytes > request.last_processed_offset_bytes

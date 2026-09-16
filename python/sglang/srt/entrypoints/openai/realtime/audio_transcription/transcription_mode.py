@@ -6,6 +6,9 @@ from typing import Awaitable, Callable, Dict, Optional
 import msgspec
 from pydantic import JsonValue
 
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
+    PCM_SAMPLE_WIDTH_BYTES,
+)
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
     RealtimeTranscriptionState,
     TranscriptionModeState,
@@ -47,7 +50,7 @@ class TranscriptionOutcome(msgspec.Struct, frozen=True):
 
 
 class TranscriptionMode(ABC):
-    """Transcription results for the processor."""
+    """Build requests and candidates using one strategy for the entire audio item."""
 
     def __init__(
         self,
@@ -56,13 +59,23 @@ class TranscriptionMode(ABC):
     ) -> None:
         self.tokenizer_manager = tokenizer_manager
         self.adapter = adapter
+        self.chunked_streaming_config = dict(adapter.chunked_streaming_config)
+        self.chunk_size_bytes = int(
+            self.chunked_streaming_config["chunk_size_sec"]
+            * adapter.model_sample_rate
+            * PCM_SAMPLE_WIDTH_BYTES
+        )
+
+    @abstractmethod
+    def create_state(self) -> TranscriptionModeState:
+        """Create a fresh candidate state for the next audio item."""
+        ...
 
     @abstractmethod
     def build_transcription_request(
         self,
         state: RealtimeTranscriptionState,
         *,
-        end_offset_bytes: int,
         is_last: bool,
     ) -> TranscriptionRequest:
         """Prepare the audio range and text state for one audio transcription request."""

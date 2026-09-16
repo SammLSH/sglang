@@ -463,7 +463,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             # No background abort_task: each chunk is a separate request;
             # client disconnection is detected via is_disconnected() in the loop.
             return StreamingResponse(
-                self._generate_chunked_transcription_stream(
+                self._generate_chunked_asr_stream(
                     adapted_request, request, raw_request
                 ),
                 media_type="text/event-stream",
@@ -606,7 +606,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         """Stream transcription of long audio pre-split into chunks.
 
         Chunks are transcribed sequentially (one streaming request at a
-        time, like ``_generate_chunked_transcription_stream``), so the client sees
+        time, like ``_generate_chunked_asr_stream``), so the client sees
         the transcript in audio order with a single finish frame after the
         last chunk. The first abnormal chunk finish_reason (length/abort)
         wins so a truncated non-final chunk isn't masked by later chunks
@@ -723,7 +723,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         yield "data: [DONE]\n\n"
 
-    async def _generate_chunked_transcription_stream(
+    async def _generate_chunked_asr_stream(
         self,
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,

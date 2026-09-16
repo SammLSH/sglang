@@ -17,19 +17,11 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mo
     TranscriptionRequest,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
-    CumulativeTranscriptionState,
     RealtimeTranscriptionState,
-    WindowedTranscriptionState,
-)
-from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
-    TranscriptionSuffixState,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     ResolvedEncoderWindowPolicy,
     WindowedTranscriptionMode,
-)
-from sglang.srt.entrypoints.openai.streaming_asr import (
-    StreamingASRState,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -50,18 +42,14 @@ class RealtimeTranscriptionProcessor:
         *,
         encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
     ) -> None:
-        # Copy defaults so every audio item starts with the same parameters.
-        self.chunked_streaming_config = dict(adapter.chunked_streaming_config)
         pcm_bytes_per_second = adapter.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
-
-        chunk_size_sec = self.chunked_streaming_config["chunk_size_sec"]
-        self.chunk_size_bytes = int(chunk_size_sec * pcm_bytes_per_second)
         serving_config = get_serving()
         self.max_buffer_bytes = (
             serving_config.asr_max_buffer_seconds * pcm_bytes_per_second
         )
         self.decoder_streaming = serving_config.enable_asr_decoder_streaming
 
+        # The selected implementation stays fixed across requests and audio items.
         self.mode: TranscriptionMode
         if encoder_window is not None:
             self.mode = WindowedTranscriptionMode(
@@ -73,19 +61,8 @@ class RealtimeTranscriptionProcessor:
             self.mode = CumulativeTranscriptionMode(tokenizer_manager, adapter)
 
     def create_transcription_state(self) -> RealtimeTranscriptionState:
-        if isinstance(self.mode, WindowedTranscriptionMode):
-            mode_state = WindowedTranscriptionState(suffix=TranscriptionSuffixState())
-        else:
-            mode_state = CumulativeTranscriptionState(
-                transcript=StreamingASRState(**self.chunked_streaming_config)
-            )
-        return RealtimeTranscriptionState(audio=AudioBuffer(), mode_state=mode_state)
-
-    def is_audio_chunk_ready(self, state: RealtimeTranscriptionState) -> bool:
-        """Require another full audio chunk so retries wait for new input."""
-        return (
-            state.audio.received_bytes - state.audio.last_attempted_offset_bytes
-            >= self.chunk_size_bytes
+        return RealtimeTranscriptionState(
+            audio=AudioBuffer(), mode_state=self.mode.create_state()
         )
 
     async def process_transcription(
@@ -97,19 +74,7 @@ class RealtimeTranscriptionProcessor:
         on_transcript_delta: TranscriptDeltaCallback,
     ) -> None:
         """Save transcription progress only after sending the new text succeeds."""
-        audio = state.audio
-        # Bound each window request even when one append contains many chunks.
-        end_offset_bytes = (
-            audio.received_bytes
-            if is_last or isinstance(self.mode, CumulativeTranscriptionMode)
-            else min(
-                audio.received_bytes,
-                audio.last_attempted_offset_bytes + self.chunk_size_bytes,
-            )
-        )
-        request = self.mode.build_transcription_request(
-            state, end_offset_bytes=end_offset_bytes, is_last=is_last
-        )
+        request = self.mode.build_transcription_request(state, is_last=is_last)
 
         async def _send_transcript_candidate(transcript_candidate: str) -> None:
             await self.send_transcript_candidate(

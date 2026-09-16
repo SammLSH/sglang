@@ -4,7 +4,6 @@ import logging
 from copy import copy
 from typing import Dict, Optional
 
-from msgspec.structs import replace
 from pydantic import JsonValue
 
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer import (
@@ -17,10 +16,10 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mo
     TranscriptionRequest,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
-    CumulativeTranscriptionState,
     RealtimeTranscriptionState,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
     apply_cumulative_transcript,
     generate_transcript,
     iter_text_unit_spans,
@@ -32,26 +31,26 @@ logger = logging.getLogger(__name__)
 class CumulativeTranscriptionMode(TranscriptionMode):
     """Transcribe all received audio using the sent transcript as decoder context."""
 
+    def create_state(self) -> StreamingASRState:
+        return StreamingASRState(**self.chunked_streaming_config)
+
     def build_transcription_request(
         self,
         state: RealtimeTranscriptionState,
         *,
-        end_offset_bytes: int,
         is_last: bool,
     ) -> TranscriptionRequest:
-        mode_state = state.mode_state
-        assert isinstance(mode_state, CumulativeTranscriptionState)
+        transcript = state.mode_state
+        assert isinstance(transcript, StreamingASRState)
         return TranscriptionRequest(
             is_last=is_last,
             start_offset_bytes=0,
-            end_offset_bytes=end_offset_bytes,
+            end_offset_bytes=state.audio.received_bytes,
             last_attempted_offset_bytes=state.audio.last_attempted_offset_bytes,
             last_processed_offset_bytes=state.audio.last_processed_offset_bytes,
             emitted_text=state.emitted_text,
-            mode_state=mode_state,
-            decoder_prefix=mode_state.transcript.get_prefix_text(
-                emitted_text=state.emitted_text
-            ),
+            mode_state=transcript,
+            decoder_prefix=transcript.get_prefix_text(emitted_text=state.emitted_text),
         )
 
     async def transcribe_audio(
@@ -63,9 +62,8 @@ class CumulativeTranscriptionMode(TranscriptionMode):
         on_transcript_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
         """Compare generated text with the sent transcript to find new text."""
-        previous_mode_state = request.mode_state
-        assert isinstance(previous_mode_state, CumulativeTranscriptionState)
-        previous_transcript_state = previous_mode_state.transcript
+        previous_transcript_state = request.mode_state
+        assert isinstance(previous_transcript_state, StreamingASRState)
         decoder_prefix = request.decoder_prefix
         samples = await extract_audio_samples(
             state.audio, request.start_offset_bytes, request.end_offset_bytes
@@ -110,7 +108,7 @@ class CumulativeTranscriptionMode(TranscriptionMode):
                 logger.warning("[realtime] cumulative ASR request returned no response")
             # Keep the audio unprocessed so the next request retries it.
             return TranscriptionOutcome(
-                next_mode_state=previous_mode_state, audio_processed=False
+                next_mode_state=previous_transcript_state, audio_processed=False
             )
         elif generated_transcript.finish_reason == "length":
             raise RuntimeError("realtime ASR decode reached max_new_tokens")
@@ -128,7 +126,7 @@ class CumulativeTranscriptionMode(TranscriptionMode):
                 raise RuntimeError("final realtime ASR recovery returned empty text")
             else:
                 return TranscriptionOutcome(
-                    next_mode_state=previous_mode_state, audio_processed=False
+                    next_mode_state=previous_transcript_state, audio_processed=False
                 )
         else:
             transcript = copy(previous_transcript_state)
@@ -139,7 +137,7 @@ class CumulativeTranscriptionMode(TranscriptionMode):
             emitted_text=request.emitted_text,
         )
         return TranscriptionOutcome(
-            next_mode_state=replace(previous_mode_state, transcript=transcript),
+            next_mode_state=transcript,
             audio_processed=True,
             delta=delta,
         )
@@ -147,12 +145,12 @@ class CumulativeTranscriptionMode(TranscriptionMode):
     def flush_pending_transcript(
         self, state: RealtimeTranscriptionState
     ) -> TranscriptionOutcome:
-        mode_state = state.mode_state
-        assert isinstance(mode_state, CumulativeTranscriptionState)
-        transcript = copy(mode_state.transcript)
+        transcript = state.mode_state
+        assert isinstance(transcript, StreamingASRState)
+        transcript = copy(transcript)
         delta = transcript.finalize(emitted_text=state.emitted_text)
         return TranscriptionOutcome(
-            next_mode_state=replace(mode_state, transcript=transcript),
+            next_mode_state=transcript,
             audio_processed=False,
             delta=delta,
         )

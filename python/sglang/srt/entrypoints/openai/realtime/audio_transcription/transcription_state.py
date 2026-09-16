@@ -13,12 +13,6 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
 )
 
 
-class CumulativeTranscriptionState(msgspec.Struct, frozen=True, tag="cumulative"):
-    """Track cumulative transcription when encoder windows are disabled."""
-
-    transcript: StreamingASRState
-
-
 class WindowedTranscriptionState(msgspec.Struct, frozen=True, tag="windowed"):
     """Keep unsent text and its audio until later transcriptions confirm the text."""
 
@@ -29,13 +23,14 @@ class WindowedTranscriptionState(msgspec.Struct, frozen=True, tag="windowed"):
     unconfirmed_audio_start_offset_bytes: int | None = None
 
 
-TranscriptionModeState = CumulativeTranscriptionState | WindowedTranscriptionState
+TranscriptionModeState = StreamingASRState | WindowedTranscriptionState
 
 
 class RealtimeTranscriptionState(msgspec.Struct):
     """Store one audio item's buffered audio, sent transcript, and transcription state."""
 
     audio: AudioBuffer
+    # The state type stays fixed; only accepted candidates replace its contents.
     mode_state: TranscriptionModeState
     emitted_text: str = ""
 
@@ -45,15 +40,11 @@ class RealtimeTranscriptionState(msgspec.Struct):
 
     @property
     def has_transcript(self) -> bool:
-        if isinstance(self.mode_state, CumulativeTranscriptionState):
-            return bool(self.mode_state.transcript.full_transcript)
+        if isinstance(self.mode_state, StreamingASRState):
+            return bool(self.mode_state.full_transcript)
         else:
             return bool(self.emitted_text or self.mode_state.suffix.pending_text)
 
     @property
     def has_unprocessed_audio(self) -> bool:
         return self.audio.received_bytes > self.audio.last_processed_offset_bytes
-
-    @property
-    def encoder_window_active(self) -> bool:
-        return isinstance(self.mode_state, WindowedTranscriptionState)

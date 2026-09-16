@@ -88,13 +88,9 @@ class StreamingASRState:
         )
         return join_text(emitted_text, text[tail_start:])[len(emitted_text) :]
 
-    def get_pending_transcript(self, *, emitted_text: str) -> str:
-        """Keep unsent text available when finishing the item or switching modes."""
-        return self.get_unsent_text(self.full_transcript, emitted_text=emitted_text)
-
     def finalize(self, *, emitted_text: str) -> str:
         """Return the remaining text now that no more audio can revise it."""
-        delta = self.get_pending_transcript(emitted_text=emitted_text)
+        delta = self.get_unsent_text(self.full_transcript, emitted_text=emitted_text)
         self.confirmed_text = self.full_transcript
         return delta
 
@@ -152,11 +148,7 @@ def _is_cjk(c: str) -> bool:
 
 
 def needs_space(prev: str, cur: str) -> bool:
-    """Return whether a boundary space is needed between emitted deltas.
-
-    Avoid spaces around punctuation and between adjacent CJK-context glyphs.
-    Shared by the realtime WS and HTTP SSE chunked streaming paths.
-    """
+    """Return whether separately recognized transcript parts need a boundary space."""
     if not prev or not cur:
         return False
     if prev[-1].isspace() or cur[0].isspace():
