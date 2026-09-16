@@ -237,12 +237,8 @@ class Serving(msgspec.Struct):
     ] = 32
     enable_asr_encoder_window: A[
         bool,
-        "Transcribe long realtime audio using recent audio windows and confirmed text instead of the entire recording. Requires model and processor support; otherwise transcription continues using the entire recording. Raise --asr-max-buffer-seconds to allow audio beyond the activation threshold. That limit still applies to the entire audio item. Experimental; not supported with disaggregation.",
+        "Use encoder windows from the first realtime ASR request, retaining recent audio and confirmed text. Requires model and processor support; otherwise transcription remains cumulative. The total audio item limit remains --asr-max-buffer-seconds. Experimental; not supported with disaggregation.",
     ] = False
-    asr_encoder_window_min_audio_seconds: A[
-        Optional[float],
-        "Audio duration in seconds after which realtime transcription can use encoder windows. The threshold rounds up to a full audio chunk; windowing starts with the following non-final chunk. Raise --asr-max-buffer-seconds to allow that chunk. Must be finite and non-negative. Unset uses the model default. Requires --enable-asr-encoder-window.",
-    ] = None
     asr_encoder_window_max_context_windows: A[
         Optional[int],
         "Target number of complete audio windows to keep with the latest incomplete window. Audio with unconfirmed text may be retained longer, up to a separate memory limit. Window size comes from the model; fewer windows can reduce accuracy. Must be positive. Unset uses the model default. Requires --enable-asr-encoder-window.",

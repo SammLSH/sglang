@@ -13,10 +13,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 
 class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
-    """Model defaults for when to use audio windows and how much context to retain."""
+    """Model defaults for bounded audio and text context in realtime transcription."""
 
-    # Shorter recordings keep using cumulative transcription.
-    min_audio_sec: float
     # Retain recent audio so each request can recognize speech across chunk edges.
     max_audio_context_windows: int
     # Keep recent confirmed text in the prompt so the decoder can continue it.

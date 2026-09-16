@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import random
 import socket
@@ -112,13 +111,6 @@ def handle_asr_validation(server_args: Any):
         raise ValueError(
             f"--asr-max-concurrent-sessions must be positive "
             f"(got {cfg.asr_max_concurrent_sessions})."
-        )
-    elif cfg.asr_encoder_window_min_audio_seconds is not None and (
-        not math.isfinite(cfg.asr_encoder_window_min_audio_seconds)
-        or cfg.asr_encoder_window_min_audio_seconds < 0
-    ):
-        raise ValueError(
-            "--asr-encoder-window-min-audio-seconds must be finite and non-negative."
         )
     elif (
         cfg.asr_encoder_window_max_context_windows is not None

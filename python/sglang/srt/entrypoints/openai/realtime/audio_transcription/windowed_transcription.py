@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from copy import copy
 from typing import Dict, Optional
 
@@ -20,7 +19,6 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mo
     TranscriptionRequest,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
-    CumulativeTranscriptionState,
     RealtimeTranscriptionState,
     WindowedTranscriptionState,
 )
@@ -63,12 +61,6 @@ class ResolvedEncoderWindowPolicy(msgspec.Struct, frozen=True):
     def leading_context_bytes(self) -> int:
         return self.config.leading_context_samples * PCM_SAMPLE_WIDTH_BYTES
 
-    def activation_threshold_bytes(
-        self, chunk_size_bytes: int, chunk_size_sec: float
-    ) -> int:
-        """Finish the threshold's audio chunk before starting windowed transcription."""
-        return math.ceil(self.policy.min_audio_sec / chunk_size_sec) * chunk_size_bytes
-
 
 class WindowedTranscriptionMode(TranscriptionMode):
     """Reuse recent audio and confirmed text instead of decoding the entire recording."""
@@ -79,22 +71,16 @@ class WindowedTranscriptionMode(TranscriptionMode):
         adapter: TranscriptionAdapter,
         *,
         encoder_window: ResolvedEncoderWindowPolicy,
-        chunk_size_bytes: int,
-        activation_threshold_bytes: int,
     ) -> None:
         super().__init__(tokenizer_manager, adapter)
         self.encoder_window = encoder_window
-        self.activation_threshold_bytes = activation_threshold_bytes
-        window_bytes = encoder_window.window_bytes
-        # Allow one extra window for retries, even when switching modes requires
-        # more audio than the usual context limit.
-        self.max_retained_audio_bytes = (
-            max(
-                (encoder_window.policy.max_audio_context_windows + 1) * window_bytes,
-                activation_threshold_bytes + chunk_size_bytes,
-            )
-            + window_bytes
+        self.unfixed_text_units = int(
+            adapter.chunked_streaming_config["unfixed_token_num"]
         )
+        # Retain the context, mutable tail, and one extra window for retries.
+        self.max_retained_audio_bytes = (
+            encoder_window.policy.max_audio_context_windows + 2
+        ) * encoder_window.window_bytes
 
     def build_transcription_request(
         self,
@@ -105,19 +91,9 @@ class WindowedTranscriptionMode(TranscriptionMode):
     ) -> TranscriptionRequest:
         """Select the audio range and decoder text for windowed transcription."""
         mode_state = state.mode_state
-        if isinstance(mode_state, CumulativeTranscriptionState):
-            suffix_state = TranscriptionSuffixState()
-            pending_transcript = mode_state.transcript.get_pending_transcript(
-                emitted_text=state.emitted_text
-            )
-            # Keep all audio so failed activation can retry cumulative transcription.
-            start_offset_bytes = 0
-        else:
-            suffix_state = mode_state.suffix
-            pending_transcript = ""
-            start_offset_bytes = self.get_audio_start_offset_bytes(
-                state, end_offset_bytes
-            )
+        assert isinstance(mode_state, WindowedTranscriptionState)
+        suffix_state = mode_state.suffix
+        start_offset_bytes = self.get_audio_start_offset_bytes(state, end_offset_bytes)
         decoder_prefix = suffix_state.build_decoder_prefix(
             self.tokenizer_manager.tokenizer,
             self.encoder_window.policy.decoder_prefix_max_tokens,
@@ -143,7 +119,6 @@ class WindowedTranscriptionMode(TranscriptionMode):
                     start_offset_bytes - state.audio.base_offset_bytes,
                 ),
                 decoder_prefix=decoder_prefix,
-                pending_transcript=pending_transcript,
             )
 
     def get_audio_start_offset_bytes(
@@ -200,11 +175,8 @@ class WindowedTranscriptionMode(TranscriptionMode):
     ) -> TranscriptionOutcome:
         """Prepare transcript updates while keeping state unchanged until text is sent."""
         previous_mode_state = request.mode_state
-        previous_suffix_state = (
-            previous_mode_state.suffix
-            if isinstance(previous_mode_state, WindowedTranscriptionState)
-            else TranscriptionSuffixState(pending_text=request.pending_transcript)
-        )
+        assert isinstance(previous_mode_state, WindowedTranscriptionState)
+        previous_suffix_state = previous_mode_state.suffix
         # Complete encoder windows can reuse cached encoder output across requests.
         assert request.start_offset_bytes % self.encoder_window.window_bytes == 0
         samples = await extract_audio_samples(
@@ -225,6 +197,7 @@ class WindowedTranscriptionMode(TranscriptionMode):
                 complete_text,
                 is_last=request.is_last,
                 holdback_units=self.encoder_window.policy.decoder_prefix_holdback_units,
+                unfixed_units=self.unfixed_text_units,
             ).delta
             await on_transcript_candidate(transcript_candidate)
 
@@ -283,35 +256,14 @@ class WindowedTranscriptionMode(TranscriptionMode):
                 error,
             )
         previous_mode_state = request.mode_state
-        if isinstance(previous_mode_state, CumulativeTranscriptionState):
-            failure_count = previous_mode_state.window_activation_failures + 1
-            windowing_disabled = failure_count >= MAX_CONSECUTIVE_WINDOW_FAILURES
-            if windowing_disabled:
-                logger.warning(
-                    "[realtime] starting windowed transcription failed %d times; this item "
-                    "falls back to cumulative transcription",
-                    failure_count,
-                )
-                next_mode_state = replace(
-                    previous_mode_state,
-                    window_activation_failures=failure_count,
-                    windowing_disabled=True,
-                )
-            else:
-                next_mode_state = replace(
-                    previous_mode_state, window_activation_failures=failure_count
-                )
+        assert isinstance(previous_mode_state, WindowedTranscriptionState)
+        failure_count = previous_mode_state.consecutive_failures + 1
+        if failure_count >= MAX_CONSECUTIVE_WINDOW_FAILURES:
+            raise RuntimeError("encoder-window ASR failed repeatedly") from error
         else:
-            failure_count = previous_mode_state.consecutive_failures + 1
-            if failure_count >= MAX_CONSECUTIVE_WINDOW_FAILURES:
-                # Cumulative transcription needs the old audio, which may be deleted.
-                raise RuntimeError(
-                    "encoder-window ASR failed repeatedly after activation"
-                )
-            else:
-                next_mode_state = replace(
-                    previous_mode_state, consecutive_failures=failure_count
-                )
+            next_mode_state = replace(
+                previous_mode_state, consecutive_failures=failure_count
+            )
         # Keep failed audio in the buffer so the next request can retry it.
         return TranscriptionOutcome(
             next_mode_state=next_mode_state, audio_processed=False
@@ -328,6 +280,7 @@ class WindowedTranscriptionMode(TranscriptionMode):
             text,
             is_last=request.is_last,
             holdback_units=self.encoder_window.policy.decoder_prefix_holdback_units,
+            unfixed_units=self.unfixed_text_units,
         )
         if (
             request.is_last
@@ -339,6 +292,7 @@ class WindowedTranscriptionMode(TranscriptionMode):
             raise RuntimeError("final realtime ASR recovery returned empty text")
         else:
             previous_mode_state = request.mode_state
+        assert isinstance(previous_mode_state, WindowedTranscriptionState)
         if (
             update.empty_generated_text
             and not request.is_last
@@ -346,14 +300,11 @@ class WindowedTranscriptionMode(TranscriptionMode):
             and not previous_mode_state.retrying_empty_text
         ):
             # Retry an empty result once before treating it as silence.
-            if isinstance(previous_mode_state, WindowedTranscriptionState):
-                next_mode_state = replace(
-                    previous_mode_state,
-                    retrying_empty_text=True,
-                    unconfirmed_audio_start_offset_bytes=request.start_offset_bytes,
-                )
-            else:
-                next_mode_state = replace(previous_mode_state, retrying_empty_text=True)
+            next_mode_state = replace(
+                previous_mode_state,
+                retrying_empty_text=True,
+                unconfirmed_audio_start_offset_bytes=request.start_offset_bytes,
+            )
             return TranscriptionOutcome(
                 next_mode_state=next_mode_state, audio_processed=False
             )
@@ -410,7 +361,6 @@ def resolve_realtime_encoder_window_policy(
     serving_config = get_serving()
     mm_processor = tokenizer_manager.mm_processor
     tokenizer = tokenizer_manager.tokenizer
-    max_buffer_seconds = serving_config.asr_max_buffer_seconds
 
     policy = adapter.realtime_encoder_window_policy
     if policy is None or not isinstance(mm_processor, EncoderWindowMixin):
@@ -422,7 +372,6 @@ def resolve_realtime_encoder_window_policy(
         return None
     else:
         overrides = {
-            "min_audio_sec": serving_config.asr_encoder_window_min_audio_seconds,
             "max_audio_context_windows": serving_config.asr_encoder_window_max_context_windows,
             "decoder_prefix_max_tokens": serving_config.asr_decoder_prefix_max_tokens,
             "decoder_prefix_holdback_units": serving_config.asr_decoder_prefix_holdback_units,
@@ -442,31 +391,14 @@ def resolve_realtime_encoder_window_policy(
         )
     else:
         resolved = ResolvedEncoderWindowPolicy(config=config, policy=policy)
-    chunk_size_sec = adapter.chunked_streaming_config["chunk_size_sec"]
-    bytes_per_second = adapter.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
-    chunk_size_bytes = int(chunk_size_sec * bytes_per_second)
-    # The audio limit must allow one full chunk beyond the activation threshold.
-    first_window_end_offset_bytes = (
-        resolved.activation_threshold_bytes(chunk_size_bytes, chunk_size_sec)
-        + chunk_size_bytes
+    logger.info(
+        "[realtime] encoder windows enabled from the first request: "
+        "%.1f s windows of %d tokens, max_context_windows %d, "
+        "prefix_tokens %d, holdback_units %d",
+        config.window_seconds,
+        config.window_tokens,
+        policy.max_audio_context_windows,
+        policy.decoder_prefix_max_tokens,
+        policy.decoder_prefix_holdback_units,
     )
-    if max_buffer_seconds * bytes_per_second < first_window_end_offset_bytes:
-        logger.warning(
-            "[realtime] encoder windowing needs at least %g s of audio but "
-            "--asr-max-buffer-seconds is %s; raise it to allow windowing",
-            first_window_end_offset_bytes / bytes_per_second,
-            max_buffer_seconds,
-        )
-    else:
-        logger.info(
-            "[realtime] encoder windowing enabled: %.1f s windows of %d tokens, "
-            "activation after %g s, max_context_windows %d, "
-            "prefix_tokens %d, holdback_units %d",
-            config.window_seconds,
-            config.window_tokens,
-            policy.min_audio_sec,
-            policy.max_audio_context_windows,
-            policy.decoder_prefix_max_tokens,
-            policy.decoder_prefix_holdback_units,
-        )
     return resolved

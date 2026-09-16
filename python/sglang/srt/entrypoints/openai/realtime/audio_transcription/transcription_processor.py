@@ -19,6 +19,10 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mo
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
     CumulativeTranscriptionState,
     RealtimeTranscriptionState,
+    WindowedTranscriptionState,
+)
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_suffix import (
+    TranscriptionSuffixState,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
     ResolvedEncoderWindowPolicy,
@@ -58,27 +62,24 @@ class RealtimeTranscriptionProcessor:
         )
         self.decoder_streaming = serving_config.enable_asr_decoder_streaming
 
+        self.mode: TranscriptionMode
         if encoder_window is not None:
-            self.window_mode = WindowedTranscriptionMode(
+            self.mode = WindowedTranscriptionMode(
                 tokenizer_manager,
                 adapter,
                 encoder_window=encoder_window,
-                chunk_size_bytes=self.chunk_size_bytes,
-                activation_threshold_bytes=encoder_window.activation_threshold_bytes(
-                    self.chunk_size_bytes, chunk_size_sec
-                ),
             )
         else:
-            self.window_mode = None
-        self.cumulative_mode = CumulativeTranscriptionMode(tokenizer_manager, adapter)
+            self.mode = CumulativeTranscriptionMode(tokenizer_manager, adapter)
 
     def create_transcription_state(self) -> RealtimeTranscriptionState:
-        return RealtimeTranscriptionState(
-            audio=AudioBuffer(),
-            mode_state=CumulativeTranscriptionState(
+        if isinstance(self.mode, WindowedTranscriptionMode):
+            mode_state = WindowedTranscriptionState(suffix=TranscriptionSuffixState())
+        else:
+            mode_state = CumulativeTranscriptionState(
                 transcript=StreamingASRState(**self.chunked_streaming_config)
-            ),
-        )
+            )
+        return RealtimeTranscriptionState(audio=AudioBuffer(), mode_state=mode_state)
 
     def is_audio_chunk_ready(self, state: RealtimeTranscriptionState) -> bool:
         """Require another full audio chunk so retries wait for new input."""
@@ -97,28 +98,16 @@ class RealtimeTranscriptionProcessor:
     ) -> None:
         """Save transcription progress only after sending the new text succeeds."""
         audio = state.audio
-        # Process one chunk at a time so a large append cannot skip the point
-        # where windowed transcription starts. Final requests include all audio.
+        # Bound each window request even when one append contains many chunks.
         end_offset_bytes = (
             audio.received_bytes
-            if is_last or self.window_mode is None
+            if is_last or isinstance(self.mode, CumulativeTranscriptionMode)
             else min(
                 audio.received_bytes,
                 audio.last_attempted_offset_bytes + self.chunk_size_bytes,
             )
         )
-        mode_state = state.mode_state
-        if (
-            self.window_mode is not None
-            and isinstance(mode_state, CumulativeTranscriptionState)
-            and not mode_state.windowing_disabled
-            and not is_last
-            and end_offset_bytes > self.window_mode.activation_threshold_bytes
-        ):
-            mode = self.window_mode
-        else:
-            mode = self.get_transcription_mode(state)
-        request = mode.build_transcription_request(
+        request = self.mode.build_transcription_request(
             state, end_offset_bytes=end_offset_bytes, is_last=is_last
         )
 
@@ -130,7 +119,7 @@ class RealtimeTranscriptionProcessor:
                 on_transcript_delta=on_transcript_delta,
             )
 
-        outcome = await mode.transcribe_audio(
+        outcome = await self.mode.transcribe_audio(
             state,
             request,
             sampling_params=sampling_params,
@@ -156,8 +145,7 @@ class RealtimeTranscriptionProcessor:
     ) -> None:
         """Send pending transcript text without transcribing the audio again."""
         previous_emitted_text = state.emitted_text
-        mode = self.get_transcription_mode(state)
-        outcome = mode.flush_pending_transcript(state)
+        outcome = self.mode.flush_pending_transcript(state)
         await self.send_transcript_candidate(
             state,
             outcome.delta,
@@ -187,14 +175,6 @@ class RealtimeTranscriptionProcessor:
         if delta:
             await on_transcript_delta(delta)
             state.emitted_text += delta
-
-    def get_transcription_mode(
-        self, state: RealtimeTranscriptionState
-    ) -> TranscriptionMode:
-        if state.encoder_window_active:
-            assert self.window_mode is not None
-            return self.window_mode
-        return self.cumulative_mode
 
     def apply_transcription_outcome(
         self,

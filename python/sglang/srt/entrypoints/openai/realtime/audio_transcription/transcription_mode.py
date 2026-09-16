@@ -33,8 +33,6 @@ class TranscriptionRequest(msgspec.Struct, frozen=True):
     # Keep preceding samples so feature extraction can compute the first frame.
     leading_context_bytes: int = 0
     decoder_prefix: str = ""
-    # Preserve unsent text when switching from cumulative to windowed transcription.
-    pending_transcript: str = ""
 
 
 class TranscriptionOutcome(msgspec.Struct, frozen=True):

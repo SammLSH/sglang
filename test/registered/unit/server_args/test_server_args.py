@@ -149,7 +149,6 @@ class TestPrepareServerArgs(CustomTestCase):
 
     def test_asr_flags_and_policy_overrides(self):
         overrides = {
-            "asr_encoder_window_min_audio_seconds": 30.5,
             "asr_encoder_window_max_context_windows": 4,
             "asr_decoder_prefix_max_tokens": 128,
             "asr_decoder_prefix_holdback_units": 0,

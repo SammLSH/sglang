@@ -103,6 +103,7 @@ class TranscriptionSuffixState(msgspec.Struct):
         *,
         is_last: bool,
         holdback_units: int,
+        unfixed_units: int | None = None,
     ) -> TranscriptionSuffixUpdate:
         """Compare consecutive transcriptions to choose text ready to send."""
         if not generated_text.strip():
@@ -130,15 +131,16 @@ class TranscriptionSuffixState(msgspec.Struct):
             transcript_candidate[start:end] for start, end in text_unit_spans
         ]
         pending_text_units = split_text_units(self.pending_text)
-        if not pending_text_units:
-            return TranscriptionSuffixUpdate(
-                delta="", pending_text=transcript_candidate
-            )
-        else:
-            agreed_unit_count = count_common_text_units(
-                pending_text_units, candidate_text_units, normalized=True
-            )
+        agreed_unit_count = count_common_text_units(
+            pending_text_units, candidate_text_units, normalized=True
+        )
         emitted_unit_count = max(0, agreed_unit_count - holdback_units)
+        if unfixed_units is not None:
+            # Use the adapter's rollback budget when a revised prefix prevents
+            # agreement, so every request need not regenerate the whole candidate.
+            emitted_unit_count = max(
+                emitted_unit_count, len(candidate_text_units) - unfixed_units
+            )
         # Keep the separator with unsent text so the next delta preserves spacing.
         pending_text_start = (
             text_unit_spans[emitted_unit_count - 1][1] if emitted_unit_count else 0

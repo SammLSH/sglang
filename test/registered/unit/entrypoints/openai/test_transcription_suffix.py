@@ -46,6 +46,17 @@ class TestTranscriptionSuffixState(CustomTestCase):
                     make_suffix_state(update).flush_pending_transcript(), ""
                 )
 
+        # A revised opening must not force every later request to decode it again.
+        state = TranscriptionSuffixState(pending_text="Sibyl has ridden and driven.")
+        candidate = "Sybil has ridden and driven past its medieval gateway many."
+        update = state.prepare_transcript_update(
+            candidate, is_last=False, holdback_units=1, unfixed_units=5
+        )
+        self.assertEqual(update.delta, "Sybil has ridden and driven")
+        self.assertEqual(update.pending_text, " past its medieval gateway many.")
+        self.assertEqual(update.delta + update.pending_text, candidate)
+        self.assertEqual(state.pending_text, "Sibyl has ridden and driven.")
+
     def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(
         self,
     ) -> None:

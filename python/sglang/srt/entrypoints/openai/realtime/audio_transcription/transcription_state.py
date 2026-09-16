@@ -14,13 +14,9 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
 
 
 class CumulativeTranscriptionState(msgspec.Struct, frozen=True, tag="cumulative"):
-    """Keep cumulative transcription available until windowed transcription succeeds."""
+    """Track cumulative transcription when encoder windows are disabled."""
 
     transcript: StreamingASRState
-    windowing_disabled: bool = False
-    window_activation_failures: int = 0
-    # Retry an empty result before switching to windowed transcription.
-    retrying_empty_text: bool = False
 
 
 class WindowedTranscriptionState(msgspec.Struct, frozen=True, tag="windowed"):

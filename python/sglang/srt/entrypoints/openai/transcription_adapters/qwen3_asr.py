@@ -41,8 +41,6 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     @property
     def realtime_encoder_window_policy(self) -> RealtimeEncoderWindowPolicy:
         return RealtimeEncoderWindowPolicy(
-            # The default audio item limit is also 60 s; raise it to allow windowing.
-            min_audio_sec=60.0,
             # Retain 48 s of recent audio; retries may temporarily need more.
             max_audio_context_windows=6,
             decoder_prefix_max_tokens=192,
