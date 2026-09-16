@@ -3,66 +3,56 @@ import asyncio
 import msgspec
 import numpy as np
 
-# Realtime input is validated as PCM16; keep all byte offsets sample-aligned.
+# PCM16 uses two bytes per sample, so trimming must keep both bytes together.
 PCM_SAMPLE_WIDTH_BYTES = 2
 
 
 class AudioBuffer(msgspec.Struct):
-    """Resident PCM16 range [base_offset_bytes, received_bytes), with absolute cursors."""
+    """Buffered PCM16 audio with byte offsets measured from the recording's start."""
 
     data: bytearray = msgspec.field(default_factory=bytearray)
-    # Resident bytes may start after offset zero once compaction drops them.
+    # Track removed bytes so offsets still refer to the original recording.
     base_offset_bytes: int = 0
-    # A deferred decode advances only `last_attempted`, so pacing waits for new
-    # input while `last_processed` keeps that audio in the next request.
+    # Track each attempt to decide when enough new audio is ready.
     last_attempted_offset_bytes: int = 0
+    # Keep this unchanged when a retry is needed so that audio is included again.
     last_processed_offset_bytes: int = 0
 
     @property
     def received_bytes(self) -> int:
         return self.base_offset_bytes + len(self.data)
 
-    def append_pcm(self, pcm: bytes) -> None:
-        self.data.extend(pcm)
-
-    def snapshot(self, start_offset_bytes: int, end_offset_bytes: int) -> bytes:
-        """Copy the audio in absolute range [start, end); the copy stays valid
-        after discard_before() drops the underlying bytes."""
-        start = start_offset_bytes - self.base_offset_bytes
-        end = end_offset_bytes - self.base_offset_bytes
-        if not (0 <= start <= end <= len(self.data)):
-            raise ValueError(
-                "audio range "
-                f"[{start_offset_bytes}, {end_offset_bytes}) is outside resident "
-                f"[{self.base_offset_bytes}, {self.received_bytes})"
-            )
-        else:
-            return bytes(memoryview(self.data)[start:end])
-
-    def discard_before(self, offset_bytes: int) -> None:
-        """Free memory by dropping all audio before an absolute offset."""
-        if offset_bytes % PCM_SAMPLE_WIDTH_BYTES:
-            raise ValueError("discard offset must be PCM16 sample-aligned")
-        elif (
-            offset_bytes < self.base_offset_bytes or offset_bytes > self.received_bytes
+    def trim_buffer(self, new_base_offset_bytes: int) -> None:
+        """Free unneeded audio to avoid keeping the entire recording in memory."""
+        if (
+            new_base_offset_bytes < self.base_offset_bytes
+            or new_base_offset_bytes > self.received_bytes
         ):
             raise ValueError(
-                f"discard offset {offset_bytes} is outside resident range "
+                f"trim offset {new_base_offset_bytes} is outside buffered audio range "
                 f"[{self.base_offset_bytes}, {self.received_bytes}]"
             )
         else:
-            del self.data[: offset_bytes - self.base_offset_bytes]
-            self.base_offset_bytes = offset_bytes
+            del self.data[: new_base_offset_bytes - self.base_offset_bytes]
+            self.base_offset_bytes = new_base_offset_bytes
 
 
-async def snapshot_samples(
+async def extract_audio_samples(
     audio: AudioBuffer, start_offset_bytes: int, end_offset_bytes: int
 ) -> np.ndarray:
-    """Copy PCM before converting it off the event loop."""
-    pcm = audio.snapshot(start_offset_bytes, end_offset_bytes)
+    """Copy audio so buffer changes cannot affect the worker thread's input."""
+    start = start_offset_bytes - audio.base_offset_bytes
+    end = end_offset_bytes - audio.base_offset_bytes
+    if not (0 <= start <= end <= len(audio.data)):
+        raise ValueError(
+            "audio range "
+            f"[{start_offset_bytes}, {end_offset_bytes}) is outside buffered audio range "
+            f"[{audio.base_offset_bytes}, {audio.received_bytes})"
+        )
+    else:
+        pcm = bytes(memoryview(audio.data)[start:end])
 
-    def _convert() -> np.ndarray:
-        # Match soundfile's PCM16 normalization used by the former WAV path.
-        return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-
-    return await asyncio.to_thread(_convert)
+    # Scale signed PCM16 samples to [-1, 1), as soundfile does when reading WAV.
+    return await asyncio.to_thread(
+        lambda: np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    )

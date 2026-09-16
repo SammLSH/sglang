@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Awaitable, Callable, Dict, Optional
 
 from pydantic import JsonValue
@@ -10,20 +9,20 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.audio_buffer imp
     AudioBuffer,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.cumulative_transcription import (
-    CumulativeMode,
+    CumulativeTranscriptionMode,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_mode import (
     TranscriptionMode,
     TranscriptionOutcome,
-    TranscriptionStep,
+    TranscriptionRequest,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
-    CumulativeState,
+    CumulativeTranscriptionState,
     RealtimeTranscriptionState,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.windowed_transcription import (
-    EncoderWindowMode,
     ResolvedEncoderWindowPolicy,
+    WindowedTranscriptionMode,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
@@ -38,7 +37,7 @@ TranscriptDeltaCallback = Callable[[str], Awaitable[None]]
 
 
 class RealtimeTranscriptionProcessor:
-    """Run a fixed transcription flow with cumulative or encoder-window logic."""
+    """Transcribe audio, send new text, then save progress for the next request."""
 
     def __init__(
         self,
@@ -46,38 +45,21 @@ class RealtimeTranscriptionProcessor:
         adapter: TranscriptionAdapter,
         *,
         encoder_window: Optional[ResolvedEncoderWindowPolicy] = None,
-        session_id: str = "",
     ) -> None:
-        # Snapshot defaults so every audio item starts with the same parameters.
+        # Copy defaults so every audio item starts with the same parameters.
         self.chunked_streaming_config = dict(adapter.chunked_streaming_config)
         pcm_bytes_per_second = adapter.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
 
         chunk_size_sec = self.chunked_streaming_config["chunk_size_sec"]
-        if not math.isfinite(chunk_size_sec) or chunk_size_sec <= 0:
-            raise ValueError("realtime ASR chunk_size_sec must be finite and positive")
-        else:
-            self.chunk_size_bytes = int(chunk_size_sec * pcm_bytes_per_second)
-        if self.chunk_size_bytes <= 0:
-            raise ValueError(
-                "realtime ASR chunk_size_sec is shorter than one PCM sample"
-            )
-        elif self.chunk_size_bytes % PCM_SAMPLE_WIDTH_BYTES:
-            raise ValueError(
-                "realtime ASR chunk_size_sec must resolve to whole PCM samples"
-            )
-        else:
-            self.max_buffer_bytes = (
-                get_serving().asr_max_buffer_seconds * pcm_bytes_per_second
-            )
-        self.decoder_streaming = bool(get_serving().enable_asr_decoder_streaming)
-
-        routed_dp_rank = (
-            encoder_window.pinned_dp_rank(session_id)
-            if encoder_window is not None and session_id
-            else None
+        self.chunk_size_bytes = int(chunk_size_sec * pcm_bytes_per_second)
+        serving_config = get_serving()
+        self.max_buffer_bytes = (
+            serving_config.asr_max_buffer_seconds * pcm_bytes_per_second
         )
+        self.decoder_streaming = serving_config.enable_asr_decoder_streaming
+
         if encoder_window is not None:
-            self.window_mode = EncoderWindowMode(
+            self.window_mode = WindowedTranscriptionMode(
                 tokenizer_manager,
                 adapter,
                 encoder_window=encoder_window,
@@ -85,30 +67,27 @@ class RealtimeTranscriptionProcessor:
                 activation_threshold_bytes=encoder_window.activation_threshold_bytes(
                     self.chunk_size_bytes, chunk_size_sec
                 ),
-                routed_dp_rank=routed_dp_rank,
             )
         else:
             self.window_mode = None
-        self.cumulative_mode = CumulativeMode(
-            tokenizer_manager, adapter, routed_dp_rank=routed_dp_rank
-        )
+        self.cumulative_mode = CumulativeTranscriptionMode(tokenizer_manager, adapter)
 
-    def create_state(self) -> RealtimeTranscriptionState:
+    def create_transcription_state(self) -> RealtimeTranscriptionState:
         return RealtimeTranscriptionState(
             audio=AudioBuffer(),
-            mode_state=CumulativeState(
+            mode_state=CumulativeTranscriptionState(
                 transcript=StreamingASRState(**self.chunked_streaming_config)
             ),
         )
 
-    def is_chunk_ready(self, state: RealtimeTranscriptionState) -> bool:
-        """True once a full chunk of audio has arrived past the last attempt."""
+    def is_audio_chunk_ready(self, state: RealtimeTranscriptionState) -> bool:
+        """Require another full audio chunk so retries wait for new input."""
         return (
             state.audio.received_bytes - state.audio.last_attempted_offset_bytes
             >= self.chunk_size_bytes
         )
 
-    async def process(
+    async def process_transcription(
         self,
         state: RealtimeTranscriptionState,
         *,
@@ -116,10 +95,10 @@ class RealtimeTranscriptionProcessor:
         sampling_params: Dict[str, JsonValue],
         on_transcript_delta: TranscriptDeltaCallback,
     ) -> None:
-        """Run one mode, publish its text, then apply the accepted outcome."""
+        """Save transcription progress only after sending the new text succeeds."""
         audio = state.audio
-        # Window handoff needs the inference chunk cadence. Ordinary cumulative
-        # requests and final requests cover all received audio, as on main.
+        # Process one chunk at a time so a large append cannot skip the point
+        # where windowed transcription starts. Final requests include all audio.
         end_offset_bytes = (
             audio.received_bytes
             if is_last or self.window_mode is None
@@ -128,111 +107,107 @@ class RealtimeTranscriptionProcessor:
                 audio.last_attempted_offset_bytes + self.chunk_size_bytes,
             )
         )
-        if self.window_mode is not None and self.window_mode.can_activate(
-            state, end_offset_bytes=end_offset_bytes, is_last=is_last
+        mode_state = state.mode_state
+        if (
+            self.window_mode is not None
+            and isinstance(mode_state, CumulativeTranscriptionState)
+            and not mode_state.windowing_disabled
+            and not is_last
+            and end_offset_bytes > self.window_mode.activation_threshold_bytes
         ):
             mode = self.window_mode
         else:
-            mode = self.active_mode(state)
-        step = mode.build_step(
+            mode = self.get_transcription_mode(state)
+        request = mode.build_transcription_request(
             state, end_offset_bytes=end_offset_bytes, is_last=is_last
         )
 
-        async def _publish_candidate(candidate: str) -> None:
-            await self.publish_candidate(
+        async def _send_transcript_candidate(transcript_candidate: str) -> None:
+            await self.send_transcript_candidate(
                 state,
-                candidate,
-                emitted_text_before=step.emitted_text,
+                transcript_candidate,
+                previous_emitted_text=request.emitted_text,
                 on_transcript_delta=on_transcript_delta,
             )
 
-        outcome = await mode.execute_step(
+        outcome = await mode.transcribe_audio(
             state,
-            step,
+            request,
             sampling_params=sampling_params,
-            on_candidate=(
-                _publish_candidate if self.decoder_streaming and not is_last else None
+            on_transcript_candidate=(
+                _send_transcript_candidate
+                if self.decoder_streaming and not is_last
+                else None
             ),
         )
-        await self.publish_candidate(
+        await self.send_transcript_candidate(
             state,
             outcome.delta,
-            emitted_text_before=step.emitted_text,
+            previous_emitted_text=request.emitted_text,
             on_transcript_delta=on_transcript_delta,
             conflict_error="completed ASR decode revised already streamed text",
         )
-        self.commit_outcome(state, step, outcome)
+        self.apply_transcription_outcome(state, request, outcome)
 
     async def flush_pending_transcript(
         self,
         state: RealtimeTranscriptionState,
         on_transcript_delta: TranscriptDeltaCallback,
     ) -> None:
-        """Publish held text and accept its state without advancing audio."""
-        emitted_text_before = state.emitted_text
-        mode = self.active_mode(state)
-        outcome = mode.flush_pending(state)
-        await self.publish_candidate(
+        """Send pending transcript text without transcribing the audio again."""
+        previous_emitted_text = state.emitted_text
+        mode = self.get_transcription_mode(state)
+        outcome = mode.flush_pending_transcript(state)
+        await self.send_transcript_candidate(
             state,
             outcome.delta,
-            emitted_text_before=emitted_text_before,
+            previous_emitted_text=previous_emitted_text,
             on_transcript_delta=on_transcript_delta,
             conflict_error="ASR flush revised already published text",
         )
-        self.commit_outcome(state, None, outcome)
+        self.apply_transcription_outcome(state, None, outcome)
 
-    async def publish_candidate(
+    async def send_transcript_candidate(
         self,
         state: RealtimeTranscriptionState,
-        candidate: str,
+        transcript_candidate: str,
         *,
-        emitted_text_before: str,
+        previous_emitted_text: str,
         on_transcript_delta: TranscriptDeltaCallback,
         conflict_error: Optional[str] = None,
     ) -> None:
-        """Skip revised previews; reject revised finals before accepting state."""
-        # Only this consumer appends text, so the step's historical prefix is fixed.
-        published_in_step = state.emitted_text[len(emitted_text_before) :]
-        if not candidate.startswith(published_in_step):
+        """Prevent partial or final results from rewriting text already sent."""
+        # Callbacks include earlier text from this request; send only the new part.
+        emitted_text_in_request = state.emitted_text[len(previous_emitted_text) :]
+        if not transcript_candidate.startswith(emitted_text_in_request):
             if conflict_error is not None:
                 raise RuntimeError(conflict_error)
-            else:
-                return
-        else:
-            delta = candidate[len(published_in_step) :]
+            return
+        delta = transcript_candidate[len(emitted_text_in_request) :]
         if delta:
             await on_transcript_delta(delta)
             state.emitted_text += delta
-        else:
-            return
 
-    def active_mode(self, state: RealtimeTranscriptionState) -> TranscriptionMode:
+    def get_transcription_mode(
+        self, state: RealtimeTranscriptionState
+    ) -> TranscriptionMode:
         if state.encoder_window_active:
             assert self.window_mode is not None
             return self.window_mode
-        else:
-            return self.cumulative_mode
+        return self.cumulative_mode
 
-    def commit_outcome(
+    def apply_transcription_outcome(
         self,
         state: RealtimeTranscriptionState,
-        step: Optional[TranscriptionStep],
+        request: Optional[TranscriptionRequest],
         outcome: TranscriptionOutcome,
     ) -> None:
-        """Accept candidate state and audio progress after successful publication."""
+        """Save state and trim audio only after sending the transcript succeeds."""
         audio = state.audio
         state.mode_state = outcome.next_mode_state
-        audio.last_attempted_offset_bytes = (
-            step.end_offset_bytes
-            if step is not None
-            else audio.last_attempted_offset_bytes
-        )
-        audio.last_processed_offset_bytes = (
-            step.end_offset_bytes
-            if step is not None and outcome.audio_covered
-            else audio.last_processed_offset_bytes
-        )
-        if outcome.discard_before_bytes is not None:
-            audio.discard_before(outcome.discard_before_bytes)
-        else:
-            return
+        if request is not None:
+            audio.last_attempted_offset_bytes = request.end_offset_bytes
+            if outcome.audio_processed:
+                audio.last_processed_offset_bytes = request.end_offset_bytes
+        if outcome.trim_buffer_offset_bytes is not None:
+            audio.trim_buffer(outcome.trim_buffer_offset_bytes)

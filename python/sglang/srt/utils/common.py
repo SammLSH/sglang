@@ -1712,8 +1712,8 @@ def load_audio(
     if sr is None:
         sr = 16000
 
-    # Already-decoded samples pass through: the caller resampled them to `sr`.
-    # Multi-channel layout is (n_samples, n_channels), as soundfile.read returns.
+    # Array inputs are already decoded and resampled to sr by the caller.
+    # Average channels on axis 1, matching soundfile's (samples, channels) layout.
     if isinstance(audio_file, np.ndarray):
         if mono and audio_file.ndim > 1:
             return np.mean(audio_file, axis=1)

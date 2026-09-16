@@ -73,11 +73,11 @@ class TestCumulativeTranscriptState(CustomTestCase):
         emitted_text += delta
         self.assertEqual(state.finalize(emitted_text=emitted_text), "")
 
-        # Exact appends can extend the final published word without repeating it.
+        # A later response may extend the last sent word, such as "two" to "twofold".
         state = StreamingASRState(2.0, 2, 1)
         state.full_transcript = "one twofold three"
         self.assertEqual(
-            state.unpublished_text(emitted_text="one two"),
+            state.get_pending_transcript(emitted_text="one two"),
             "fold three",
         )
 
@@ -156,7 +156,7 @@ class TestTranscriptionBackendContract(CustomTestCase):
                 closed.clear()
                 with self.assertRaises(expected) as caught:
                     await generate_transcript(
-                        manager, adapter, bytes(4), {}, on_update=callback
+                        manager, adapter, bytes(4), {}, on_transcript_update=callback
                     )
                 self.assertEqual(closed, [True])
                 if expected is TranscriptionBackendAborted:

@@ -108,33 +108,35 @@ def handle_asr_validation(server_args: Any):
             f"--asr-max-buffer-seconds must be positive "
             f"(got {cfg.asr_max_buffer_seconds})."
         )
-    if cfg.asr_max_concurrent_sessions <= 0:
+    elif cfg.asr_max_concurrent_sessions <= 0:
         raise ValueError(
             f"--asr-max-concurrent-sessions must be positive "
             f"(got {cfg.asr_max_concurrent_sessions})."
         )
-    if cfg.asr_encoder_window_min_audio_seconds is not None and (
+    elif cfg.asr_encoder_window_min_audio_seconds is not None and (
         not math.isfinite(cfg.asr_encoder_window_min_audio_seconds)
         or cfg.asr_encoder_window_min_audio_seconds < 0
     ):
         raise ValueError(
             "--asr-encoder-window-min-audio-seconds must be finite and non-negative."
         )
-    if (
+    elif (
         cfg.asr_encoder_window_max_context_windows is not None
         and cfg.asr_encoder_window_max_context_windows <= 0
     ):
         raise ValueError("--asr-encoder-window-max-context-windows must be positive.")
-    if (
+    elif (
         cfg.asr_decoder_prefix_max_tokens is not None
         and cfg.asr_decoder_prefix_max_tokens <= 0
     ):
         raise ValueError("--asr-decoder-prefix-max-tokens must be positive.")
-    if (
+    elif (
         cfg.asr_decoder_prefix_holdback_units is not None
         and cfg.asr_decoder_prefix_holdback_units < 0
     ):
         raise ValueError("--asr-decoder-prefix-holdback-units must be non-negative.")
+    else:
+        return
 
 
 def handle_multimodal(server_args: Any):

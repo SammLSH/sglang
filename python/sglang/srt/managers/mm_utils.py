@@ -369,7 +369,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 def concat_padded_audio_features(
     items: List[MultimodalDataItem], *, mask_key: str = "feature_attention_mask"
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Batch (batch, n_mels, frames) features, padding only unequal widths."""
+    """Pad audio features to a common frame count so different durations can be batched."""
     masks = [item.model_specific_data.get(mask_key) for item in items]
     if len(items) == 1:
         return items[0].feature, masks[0]

@@ -5,152 +5,162 @@ from transformers import PreTrainedTokenizerBase
 
 from sglang.srt.entrypoints.openai.streaming_asr import (
     _is_cjk,
-    common_unit_prefix,
-    iter_unit_spans,
-    split_units,
+    count_common_text_units,
+    iter_text_unit_spans,
+    split_text_units,
 )
 
-# Limit tokenizer input work; the actual token budget is checked after truncation.
+# Limit text passed to the tokenizer so long transcripts do not slow each request.
 MAX_CHARS_PER_TOKEN = 64
 
 
-class SuffixUpdate(msgspec.Struct, frozen=True):
-    """One reconcile result, applied only after its request is accepted."""
+class TranscriptionSuffixUpdate(msgspec.Struct, frozen=True):
+    """Separate text ready to send from text that still needs confirmation."""
 
-    # Exact append to the step's published text, including boundary whitespace.
+    # Preserve whitespace so this text can be appended directly to the transcript.
     delta: str
-    pending: str
-    # Character prefix of pending confirmed by agreement but held from publication.
-    confirmed_pending_chars: int = 0
-    # True when the decode produced no new text; the caller decides whether
-    # to defer the audio or accept the silence.
-    empty_continuation: bool = False
+    pending_text: str
+    # Keep confirmed but unsent text available for the next decoder prompt.
+    confirmed_pending_text_chars: int = 0
+    # The caller decides whether an empty result needs a retry or is silence.
+    empty_generated_text: bool = False
 
 
-def align_to_unit_boundary(source: str, tail: str) -> str:
-    """Drop a leading partial unit introduced by token-level slicing."""
-    tail = tail.lstrip()
-    if not tail:
+def trim_partial_word(confirmed_text: str, decoder_prefix: str) -> str:
+    """Avoid starting the decoder prompt in the middle of a word after truncation."""
+    decoder_prefix = decoder_prefix.lstrip()
+    if not decoder_prefix:
         return ""
     else:
-        start = len(source) - len(tail)
-    if source.endswith(tail) and (
+        start = len(confirmed_text) - len(decoder_prefix)
+    if confirmed_text.endswith(decoder_prefix) and (
         start == 0
-        or source[start - 1].isspace()
-        or _is_cjk(source[start - 1])
-        or _is_cjk(tail[0])
+        or confirmed_text[start - 1].isspace()
+        or _is_cjk(confirmed_text[start - 1])
+        or _is_cjk(decoder_prefix[0])
     ):
-        return tail
+        return decoder_prefix
     else:
-        units = split_units(tail)
-        return tail[len(units[0]) :].lstrip() if len(units) > 1 else ""
+        units = split_text_units(decoder_prefix)
+        return decoder_prefix[len(units[0]) :].lstrip() if len(units) > 1 else ""
 
 
 class TranscriptionSuffixState(msgspec.Struct):
-    """Unpublished continuation and its confirmed prefix; published text is external."""
+    """Hold unsent text so later transcriptions can confirm or revise it."""
 
-    # Exact unpublished suffix, including any separator after published text.
-    # Its confirmed prefix is also supplied to the decoder.
-    pending: str = ""
-    confirmed_pending_chars: int = 0
+    # Keep leading whitespace so sending this text preserves word boundaries.
+    pending_text: str = ""
+    confirmed_pending_text_chars: int = 0
 
     @property
-    def confirmed_pending(self) -> str:
-        return self.pending[: self.confirmed_pending_chars]
+    def confirmed_pending_text(self) -> str:
+        return self.pending_text[: self.confirmed_pending_text_chars]
 
-    def bounded_prefix(
+    def build_decoder_prefix(
         self, tokenizer: PreTrainedTokenizerBase, max_tokens: int, *, emitted_text: str
     ) -> str:
-        """Bound recent confirmed context by tokens, retaining whole text units."""
-        if max_tokens <= 0:
-            return ""
-        else:
-            max_chars = max_tokens * MAX_CHARS_PER_TOKEN
-        # Retain one predecessor character for partial-word boundary checks.
-        pending_start = max(0, self.confirmed_pending_chars - max_chars - 1)
-        confirmed_tail = self.pending[pending_start : self.confirmed_pending_chars]
+        """Fit recent confirmed text into the decoder token limit without cutting words."""
+        max_chars = max_tokens * MAX_CHARS_PER_TOKEN
+        # Keep one extra character to check whether truncation cuts a word.
+        pending_text_start = max(0, self.confirmed_pending_text_chars - max_chars - 1)
+        confirmed_tail = self.pending_text[
+            pending_text_start : self.confirmed_pending_text_chars
+        ]
         history_chars = max_chars + 1 - len(confirmed_tail)
-        source = (
+        confirmed_text = (
             emitted_text[-history_chars:] + confirmed_tail
             if history_chars
             else confirmed_tail
         )
-        if not source:
+        if not confirmed_text:
             return ""
         else:
-            tail = source[-max_chars:]
-        token_ids = tokenizer.encode(tail, add_special_tokens=False)
-        tail = (
+            decoder_prefix = confirmed_text[-max_chars:]
+        token_ids = tokenizer.encode(decoder_prefix, add_special_tokens=False)
+        decoder_prefix = (
             tokenizer.decode(
                 token_ids[-max_tokens:],
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
             if len(token_ids) > max_tokens
-            else tail
+            else decoder_prefix
         )
-        tail = align_to_unit_boundary(source, tail)
-        # Removing a leading space or partial unit can change tokenization.
-        # Check the actual prefix, dropping whole units until it fits.
+        decoder_prefix = trim_partial_word(confirmed_text, decoder_prefix)
+        # Removing a space or partial word can change the token count.
         while (
-            tail and len(tokenizer.encode(tail, add_special_tokens=False)) > max_tokens
+            decoder_prefix
+            and len(tokenizer.encode(decoder_prefix, add_special_tokens=False))
+            > max_tokens
         ):
-            first_unit = split_units(tail)[0]
-            tail = tail[len(first_unit) :].lstrip()
-        return tail
+            first_unit = split_text_units(decoder_prefix)[0]
+            decoder_prefix = decoder_prefix[len(first_unit) :].lstrip()
+        return decoder_prefix
 
-    def reconcile(
+    def prepare_transcript_update(
         self,
-        continuation: str,
+        generated_text: str,
         *,
         is_last: bool,
         holdback_units: int,
-    ) -> SuffixUpdate:
-        """Compare text units, then slice exact delta and pending text without mutating."""
-        if not continuation.strip():
+    ) -> TranscriptionSuffixUpdate:
+        """Compare consecutive transcriptions to choose text ready to send."""
+        if not generated_text.strip():
             if is_last:
-                return SuffixUpdate(delta=self.pending, pending="")
+                return TranscriptionSuffixUpdate(
+                    delta=self.pending_text, pending_text=""
+                )
             else:
-                return SuffixUpdate(
+                return TranscriptionSuffixUpdate(
                     delta="",
-                    pending=self.pending,
-                    confirmed_pending_chars=self.confirmed_pending_chars,
-                    empty_continuation=True,
+                    pending_text=self.pending_text,
+                    confirmed_pending_text_chars=self.confirmed_pending_text_chars,
+                    empty_generated_text=True,
                 )
         else:
-            # The decoder already received the holdback; "car" + "pet" is "carpet".
-            candidate = self.confirmed_pending + continuation
+            # The prompt already contains confirmed text: "car" + "pet" is "carpet".
+            transcript_candidate = self.confirmed_pending_text + generated_text
         if is_last:
-            return SuffixUpdate(delta=candidate, pending="")
-        else:
-            spans = list(iter_unit_spans(candidate))
-        continuation_units = [candidate[start:end] for start, end in spans]
-        pending_units = split_units(self.pending)
-        if not pending_units:
-            return SuffixUpdate(delta="", pending=candidate)
-        else:
-            agreed = common_unit_prefix(
-                pending_units, continuation_units, normalized=True
+            return TranscriptionSuffixUpdate(
+                delta=transcript_candidate, pending_text=""
             )
-        emit = max(0, agreed - holdback_units)
-        # Leave the separator after the last emitted unit with the pending tail.
-        pending_start = spans[emit - 1][1] if emit else 0
-        # Keep an accepted character prefix even when new audio extends its
-        # final word; that word still needs agreement before publication.
-        confirmed_end = (
-            len(candidate)
-            if pending_units == continuation_units
-            else self.confirmed_pending_chars
+        else:
+            text_unit_spans = list(iter_text_unit_spans(transcript_candidate))
+        candidate_text_units = [
+            transcript_candidate[start:end] for start, end in text_unit_spans
+        ]
+        pending_text_units = split_text_units(self.pending_text)
+        if not pending_text_units:
+            return TranscriptionSuffixUpdate(
+                delta="", pending_text=transcript_candidate
+            )
+        else:
+            agreed_unit_count = count_common_text_units(
+                pending_text_units, candidate_text_units, normalized=True
+            )
+        emitted_unit_count = max(0, agreed_unit_count - holdback_units)
+        # Keep the separator with unsent text so the next delta preserves spacing.
+        pending_text_start = (
+            text_unit_spans[emitted_unit_count - 1][1] if emitted_unit_count else 0
         )
-        return SuffixUpdate(
-            delta=candidate[:pending_start],
-            pending=candidate[pending_start:],
-            confirmed_pending_chars=max(0, confirmed_end - pending_start),
+        # Keep confirmed characters when the decoder extends their last word;
+        # the extended word still needs confirmation before it can be sent.
+        confirmed_text_end = (
+            len(transcript_candidate)
+            if pending_text_units == candidate_text_units
+            else self.confirmed_pending_text_chars
+        )
+        return TranscriptionSuffixUpdate(
+            delta=transcript_candidate[:pending_text_start],
+            pending_text=transcript_candidate[pending_text_start:],
+            confirmed_pending_text_chars=max(
+                0, confirmed_text_end - pending_text_start
+            ),
         )
 
-    def flush(self) -> str:
-        """Release the pending tail for the caller to publish."""
-        delta = self.pending
-        self.pending = ""
-        self.confirmed_pending_chars = 0
+    def flush_pending_transcript(self) -> str:
+        """Return and clear unsent text when the audio item is complete."""
+        delta = self.pending_text
+        self.pending_text = ""
+        self.confirmed_pending_text_chars = 0
         return delta

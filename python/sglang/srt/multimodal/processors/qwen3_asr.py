@@ -61,15 +61,13 @@ class Qwen3ASRMultimodalProcessor(EncoderWindowMixin):
                 "Qwen3-ASR encoder windowing requires 100-frame convolution blocks; "
                 f"configured {alignment_frames} frames"
             )
-        # The audio encoder convolves and position-encodes 2 * n_window mel
-        # frames at a time and attends within n_window_infer frames, so one
-        # n_window_infer-frame window is the smallest independently encodable
-        # unit and must hold a whole number of convolution blocks.
+        # Attention uses n_window_infer frames; convolution uses 2 * n_window.
+        # Keep both groups intact so splitting preserves the encoder output.
         return EncoderWindowSpec(
             window_frames=int(audio_config.n_window_infer),
             alignment_frames=alignment_frames,
-            # Each item must contain a full convolution block so a cache hit
-            # on another item cannot change the native encoder's padding.
+            # A tail shorter than one convolution block needs the preceding window
+            # to preserve padding when other windows are already cached.
             merge_tail_below_frames=alignment_frames,
         )
 

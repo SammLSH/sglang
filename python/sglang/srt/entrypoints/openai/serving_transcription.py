@@ -79,7 +79,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._session_semaphore = asyncio.Semaphore(
             get_serving().asr_max_concurrent_sessions
         )
-        # Validate window geometry once at startup, before accepting sessions.
+        # Check model support and window sizes before accepting audio sessions.
         serving_config = get_serving()
         if serving_config.enable_asr_encoder_window:
             self.encoder_window = resolve_realtime_encoder_window_policy(
@@ -744,7 +744,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
         state = StreamingASRState(**self._adapter.chunked_streaming_config)
-        # Publication is separate from the candidate updated for each chunk.
+        # Record sent text separately because later chunks can revise model output.
         emitted_text = ""
 
         try:
@@ -769,8 +769,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 )
 
                 if delta:
-                    # The text layer supplies the exact append, including its
-                    # boundary spaces. Send one SSE event for this chunk's delta.
+                    # Preserve the supplied spacing so deltas form the same transcript.
                     chunk_resp = TranscriptionStreamResponse(
                         id=request_id,
                         created=created_time,

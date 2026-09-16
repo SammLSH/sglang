@@ -13,34 +13,34 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
 )
 
 
-class CumulativeState(msgspec.Struct, frozen=True, tag="cumulative"):
-    """Cumulative candidates and recovery before a window handoff commits."""
+class CumulativeTranscriptionState(msgspec.Struct, frozen=True, tag="cumulative"):
+    """Keep cumulative transcription available until windowed transcription succeeds."""
 
     transcript: StreamingASRState
-    window_disabled: bool = False
-    handoff_failures: int = 0
-    # An empty first continuation is retried without activating windowing.
-    deferred_empty_continuation: bool = False
+    windowing_disabled: bool = False
+    window_activation_failures: int = 0
+    # Retry an empty result before switching to windowed transcription.
+    retrying_empty_text: bool = False
 
 
-class WindowedState(msgspec.Struct, frozen=True, tag="windowed"):
-    """Continuation candidates and the audio retained for their confirmation."""
+class WindowedTranscriptionState(msgspec.Struct, frozen=True, tag="windowed"):
+    """Keep unsent text and its audio until later transcriptions confirm the text."""
 
     suffix: TranscriptionSuffixState
     consecutive_failures: int = 0
-    deferred_empty_continuation: bool = False
-    # Keep the request start fixed while decoded text is still unconfirmed.
-    unconfirmed_start_offset_bytes: int | None = None
+    retrying_empty_text: bool = False
+    # Reuse this audio until later transcriptions confirm its text.
+    unconfirmed_audio_start_offset_bytes: int | None = None
 
 
-ModeState = CumulativeState | WindowedState
+TranscriptionModeState = CumulativeTranscriptionState | WindowedTranscriptionState
 
 
 class RealtimeTranscriptionState(msgspec.Struct):
-    """One item's PCM, successfully published text, and accepted mode state."""
+    """Store one audio item's buffered audio, sent transcript, and transcription state."""
 
     audio: AudioBuffer
-    mode_state: ModeState
+    mode_state: TranscriptionModeState
     emitted_text: str = ""
 
     @property
@@ -49,15 +49,15 @@ class RealtimeTranscriptionState(msgspec.Struct):
 
     @property
     def has_transcript(self) -> bool:
-        if isinstance(self.mode_state, CumulativeState):
+        if isinstance(self.mode_state, CumulativeTranscriptionState):
             return bool(self.mode_state.transcript.full_transcript)
         else:
-            return bool(self.emitted_text or self.mode_state.suffix.pending)
+            return bool(self.emitted_text or self.mode_state.suffix.pending_text)
 
     @property
-    def has_new_audio(self) -> bool:
+    def has_unprocessed_audio(self) -> bool:
         return self.audio.received_bytes > self.audio.last_processed_offset_bytes
 
     @property
     def encoder_window_active(self) -> bool:
-        return isinstance(self.mode_state, WindowedState)
+        return isinstance(self.mode_state, WindowedTranscriptionState)

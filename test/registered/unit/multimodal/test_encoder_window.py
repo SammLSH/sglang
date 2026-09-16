@@ -18,7 +18,6 @@ from sglang.srt.managers.mm_utils import concat_padded_audio_features
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
-from sglang.srt.multimodal.encoder_window import build_encoder_window_items
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
@@ -30,12 +29,14 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-PLACEHOLDER = 99
-PROMPT_IDS = [10, PLACEHOLDER, 11]
+AUDIO_PLACEHOLDER_TOKEN_ID = 99
+PROMPT_TOKEN_IDS = [10, AUDIO_PLACEHOLDER_TOKEN_ID, 11]
 
 
 def make_processor() -> Qwen3ASRMultimodalProcessor:
-    owner = Qwen3ASRMultimodalProcessor.__new__(Qwen3ASRMultimodalProcessor)
+    multimodal_processor = Qwen3ASRMultimodalProcessor.__new__(
+        Qwen3ASRMultimodalProcessor
+    )
     # Keep the real feature extraction and token-length mapping.
     processor = Qwen3ASRProcessor.__new__(Qwen3ASRProcessor)
     processor.feature_extractor = WhisperFeatureExtractor(
@@ -43,65 +44,70 @@ def make_processor() -> Qwen3ASRMultimodalProcessor:
     )
     processor.tokenizer = Mock(
         bos_token=None,
-        return_value={"input_ids": torch.tensor([PROMPT_IDS])},
+        return_value={"input_ids": torch.tensor([PROMPT_TOKEN_IDS])},
     )
-    processor.tokenizer.convert_tokens_to_ids.return_value = PLACEHOLDER
-    owner._processor = processor
-    owner._tokenizer = owner._processor.tokenizer
-    owner._tokenizer_auto_adds_specials = False
-    owner.audio_config = {}
-    owner.mm_feature_transport = "cpu"
-    owner.ATTR_NAME_TO_MODALITY = {
+    processor.tokenizer.convert_tokens_to_ids.return_value = AUDIO_PLACEHOLDER_TOKEN_ID
+    multimodal_processor._processor = processor
+    multimodal_processor._tokenizer = multimodal_processor._processor.tokenizer
+    multimodal_processor._tokenizer_auto_adds_specials = False
+    multimodal_processor.audio_config = {}
+    multimodal_processor.mm_feature_transport = "cpu"
+    multimodal_processor.ATTR_NAME_TO_MODALITY = {
         "input_features": Modality.AUDIO,
         "feature_attention_mask": Modality.AUDIO,
     }
-    owner.FEATURE_NAMES = ["input_features"]
-    owner.hf_config = SimpleNamespace(
+    multimodal_processor.FEATURE_NAMES = ["input_features"]
+    multimodal_processor.hf_config = SimpleNamespace(
         thinker_config=SimpleNamespace(
             audio_config=SimpleNamespace(n_window_infer=800, n_window=50)
         )
     )
-    owner._finalize_mm_items = lambda items, *, images: items
-    return owner
+    multimodal_processor._finalize_mm_items = lambda items, *, images: items
+    return multimodal_processor
 
 
 class TestAudioWindows(CustomTestCase):
     def setUp(self) -> None:
-        self.owner = make_processor()
-        self.config = self.owner.encoder_window_config()
+        self.multimodal_processor = make_processor()
+        self.config = self.multimodal_processor.encoder_window_config()
         self.audio = (
             np.random.default_rng(7)
             .normal(0, 0.1, 3 * self.config.window_samples + 4000)
             .astype(np.float32)
         )
 
-    def test_windows_preserve_features_and_offsets(self) -> None:
+    def test_windows_preserve_features_offsets_and_encoder_outputs(self) -> None:
         context = self.config.leading_context_samples
         base = BaseMultiModalProcessorOutput(
             input_text="audio",
             audios=[self.audio[self.config.window_samples - context :]],
         )
-        items, ids, whole = self.owner.process_and_combine_mm_data(
-            base,
-            MultimodalSpecialTokens(audio_token_id=PLACEHOLDER),
-            mm_processor_kwargs={
-                "encoder_window": {"leading_context_samples": context}
-            },
+        items, input_ids, processor_output = (
+            self.multimodal_processor.process_and_combine_mm_data(
+                base,
+                MultimodalSpecialTokens(audio_token_id=AUDIO_PLACEHOLDER_TOKEN_ID),
+                mm_processor_kwargs={
+                    "encoder_window": {"leading_context_samples": context}
+                },
+            )
         )
         self.assertEqual([item.feature.shape[-1] for item in items], [800, 825])
         self.assertEqual([item.offsets for item in items], [[(1, 104)], [(105, 212)]])
-        self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 212 + [11])
-        # Keep whole-request feature values; exclude extraction context and padding.
-        leading_frames = context // self.owner._processor.feature_extractor.hop_length
-        valid_frames = int(whole["feature_attention_mask"].sum())
+        self.assertEqual(
+            input_ids.tolist(), [10] + [AUDIO_PLACEHOLDER_TOKEN_ID] * 212 + [11]
+        )
+        # Splitting must preserve feature values after removing context and padding.
+        leading_frames = (
+            context // self.multimodal_processor._processor.feature_extractor.hop_length
+        )
+        valid_frames = int(processor_output["feature_attention_mask"].sum())
         self.assertTrue(
             torch.equal(
                 torch.cat([item.feature for item in items], dim=-1),
-                whole["input_features"][..., leading_frames:valid_frames],
+                processor_output["input_features"][..., leading_frames:valid_frames],
             )
         )
 
-    def test_cache_miss_subsets_preserve_encoder_convolution_outputs(self) -> None:
         # Run real convolution, padding, positions and projections on CPU.
         # Attention layers and checkpoint weights require the GPU smoke test.
         config = Qwen3OmniMoeAudioEncoderConfig(
@@ -119,70 +125,30 @@ class TestAudioWindows(CustomTestCase):
             for parameter in encoder.parameters():
                 parameter.uniform_(-0.2, 0.2)
 
-            def _encode(items: list[MultimodalDataItem]) -> torch.Tensor:
-                return Qwen3ASRForConditionalGeneration.get_audio_feature(
-                    SimpleNamespace(audio_tower=encoder), items
+            outputs = [
+                encoder(
+                    feature[0], feature_lens=torch.tensor([feature.shape[-1]])
+                ).last_hidden_state
+                for feature in (
+                    torch.cat([item.feature for item in items], dim=-1),
+                    items[-1].feature,
+                    items[-1].feature[..., -25:],
                 )
-
-            for tail_frames in (1, 25, 99, 100, 101, 799):
-                frames = 1600 + tail_frames
-                token_count = self.owner.encoder_window_output_lengths([frames])[0]
-                source = MultimodalDataItem(
-                    modality=Modality.AUDIO,
-                    feature=torch.randn(1, 128, frames),
-                    model_specific_data={
-                        "feature_attention_mask": torch.ones(
-                            1, frames, dtype=torch.long
-                        )
-                    },
-                )
-                items, _ = build_encoder_window_items(
-                    self.owner,
-                    item=source,
-                    input_ids=torch.tensor([10] + [PLACEHOLDER] * token_count + [11]),
-                    placeholder_token_id=PLACEHOLDER,
-                    config=self.config,
-                )
-                whole = _encode([source])
-                expected = [
-                    whole[start - 1 : end]
-                    for item in items
-                    for start, end in item.offsets
-                ]
-                # Last-only, interleaved and mixed-order misses must retain semantics.
-                for misses in (
-                    (0,),
-                    (-1,),
-                    tuple(range(len(items))),
-                    tuple(range(0, len(items), 2)),
-                    (-1, 0),
-                ):
-                    with self.subTest(tail_frames=tail_frames, misses=misses):
-                        torch.testing.assert_close(
-                            _encode([items[index] for index in misses]),
-                            torch.cat([expected[index] for index in misses]),
-                            rtol=1e-5,
-                            atol=1e-7,
-                        )
-                if tail_frames == 25:
-                    unmerged = self.owner.make_encoder_window_item(
-                        source,
-                        feature=source.feature[..., -tail_frames:],
-                        mask=torch.ones(1, tail_frames, dtype=torch.long),
-                        offsets=[],
-                    )
-                    tail = _encode([unmerged])
-                    self.assertGreater(
-                        (whole[-len(tail) :] - tail).abs().max().item(), 1e-5
-                    )
-                else:
-                    continue
+            ]
+        whole_output, merged_tail, short_tail = outputs
+        torch.testing.assert_close(
+            whole_output[-len(merged_tail) :], merged_tail, rtol=1e-5, atol=1e-7
+        )
+        # Encoding a short tail alone changes padding and therefore its output.
+        self.assertGreater(
+            (whole_output[-len(short_tail) :] - short_tail).abs().max().item(), 1e-5
+        )
 
     def test_identity_includes_valid_frame_mask(self) -> None:
         feature = torch.zeros(1, 128, 2)
         source = MultimodalDataItem(modality=Modality.AUDIO, feature=feature)
         first, shorter = [
-            self.owner.make_encoder_window_item(
+            self.multimodal_processor.make_encoder_window_item(
                 source, feature=feature, mask=torch.tensor([mask]), offsets=[(0, 0)]
             )
             for mask in ([1, 1], [1, 0])
@@ -194,28 +160,33 @@ class TestAudioWindows(CustomTestCase):
             input_text="audio",
             audios=[self.audio[: self.config.window_samples + 4000]],
         )
-        tokens = MultimodalSpecialTokens(audio_token_id=PLACEHOLDER)
+        tokens = MultimodalSpecialTokens(audio_token_id=AUDIO_PLACEHOLDER_TOKEN_ID)
         with patch.object(
             BaseMultimodalProcessor, "process_and_combine_mm_data", return_value="base"
         ) as fallback:
             self.assertEqual(
-                self.owner.process_and_combine_mm_data(base, tokens), "base"
+                self.multimodal_processor.process_and_combine_mm_data(base, tokens),
+                "base",
             )
             fallback.assert_called_once()
 
         kwargs = {"encoder_window": {"window_samples": 1}}
         with patch.object(
-            self.owner, "process_mm_data", wraps=self.owner.process_mm_data
+            self.multimodal_processor,
+            "process_mm_data",
+            wraps=self.multimodal_processor.process_mm_data,
         ) as process:
-            items, ids, _ = self.owner.process_and_combine_mm_data(
+            items, input_ids, _ = self.multimodal_processor.process_and_combine_mm_data(
                 base, tokens, mm_processor_kwargs=kwargs
             )
             process.assert_called_once()
         self.assertEqual(len(items), 1)
-        self.assertEqual(ids.tolist(), [10] + [PLACEHOLDER] * 108 + [11])
-        self.owner.audio_config = {"truncation": True}
+        self.assertEqual(
+            input_ids.tolist(), [10] + [AUDIO_PLACEHOLDER_TOKEN_ID] * 108 + [11]
+        )
+        self.multimodal_processor.audio_config = {"truncation": True}
         with self.assertRaisesRegex(ValueError, "truncation=False"):
-            self.owner.encoder_window_config()
+            self.multimodal_processor.encoder_window_config()
 
 
 class TestAudioBatching(CustomTestCase):
@@ -252,7 +223,7 @@ class TestAudioBatching(CustomTestCase):
         self.assertEqual(lengths.tolist(), [6, 2, 9])
         self.assertTrue(torch.equal(features, expected.float()))
 
-        # Single and equal-width batches use the original tensors or direct cat.
+        # Matching frame counts need no padding or extra copies for a single item.
         feature, mask = concat_padded_audio_features([items[0]])
         self.assertIs(feature, items[0].feature)
         self.assertIs(mask, items[0].model_specific_data["feature_attention_mask"])

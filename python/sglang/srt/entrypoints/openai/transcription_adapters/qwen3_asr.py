@@ -41,13 +41,10 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     @property
     def realtime_encoder_window_policy(self) -> RealtimeEncoderWindowPolicy:
         return RealtimeEncoderWindowPolicy(
-            # Equals the default --asr-max-buffer-seconds, so windowing stays
-            # dormant until an operator raises the per-item cap.
+            # The default audio item limit is also 60 s; raise it to allow windowing.
             min_audio_sec=60.0,
-            # Target six native 8 s windows (48 s) of rolling context;
-            # unconfirmed text temporarily retains additional audio.
+            # Retain 48 s of recent audio; retries may temporarily need more.
             max_audio_context_windows=6,
-            # Default recent-text budget, overridable at server startup.
             decoder_prefix_max_tokens=192,
             decoder_prefix_holdback_units=1,
         )
@@ -71,7 +68,7 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def postprocess_streaming_text(
         self, text: str, *, continuation: bool = False
     ) -> Optional[str]:
-        # Buffer split language markers; transcript continuations have no marker.
+        # A response can split the language marker; wait until it ends to show text.
         if not continuation and self.ASR_TEXT_TAG not in text:
             return None
         else:

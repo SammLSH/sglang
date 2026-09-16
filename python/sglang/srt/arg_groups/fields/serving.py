@@ -229,7 +229,7 @@ class Serving(msgspec.Struct):
     ] = "model"
     asr_max_buffer_seconds: A[
         int,
-        "Maximum total seconds of PCM audio received per realtime ASR audio item, including audio already processed or discarded from rolling context. Applies to all transcription modes and languages; exceeding it closes the session with a buffer_overflow error. Default 60s.",
+        "Maximum total audio duration in seconds per realtime ASR item, including audio already processed or removed from memory. Exceeding the limit closes the session with a buffer_overflow error. Applies in every transcription mode. Default 60s.",
     ] = 60
     asr_max_concurrent_sessions: A[
         int,
@@ -237,27 +237,27 @@ class Serving(msgspec.Struct):
     ] = 32
     enable_asr_encoder_window: A[
         bool,
-        "Enable encoder-window rolling context for realtime ASR models that declare independently encodable audio windows. It activates only after the configured long-audio threshold (the adapter's default unless overridden), so raise --asr-max-buffer-seconds above that threshold. Models without both a processor capability and an adapter policy stay cumulative, with inference cost growing as the item grows. The total item limit remains --asr-max-buffer-seconds in all modes. Experimental; not supported with disaggregation.",
+        "Transcribe long realtime audio using recent audio windows and confirmed text instead of the entire recording. Requires model and processor support; otherwise transcription continues using the entire recording. Raise --asr-max-buffer-seconds to allow audio beyond the activation threshold. That limit still applies to the entire audio item. Experimental; not supported with disaggregation.",
     ] = False
     asr_encoder_window_min_audio_seconds: A[
         Optional[float],
-        "Override only the activation threshold for encoder-window realtime ASR, without changing the total item limit. Must be finite and non-negative; activation is checked after the threshold, rounded up to an inference boundary. Raise --asr-max-buffer-seconds above that boundary. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+        "Audio duration in seconds after which realtime transcription can use encoder windows. The threshold rounds up to a full audio chunk; windowing starts with the following non-final chunk. Raise --asr-max-buffer-seconds to allow that chunk. Must be finite and non-negative. Unset uses the model default. Requires --enable-asr-encoder-window.",
     ] = None
     asr_encoder_window_max_context_windows: A[
         Optional[int],
-        "Override the target number of complete encoder-native windows kept as rolling acoustic context in realtime ASR, plus the mutable tail. Unconfirmed text can temporarily retain more audio, up to a bounded recovery limit. Must be positive. This does not change the model's native window size; fewer windows can reduce transcription accuracy. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+        "Target number of complete audio windows to keep with the latest incomplete window. Audio with unconfirmed text may be retained longer, up to a separate memory limit. Window size comes from the model; fewer windows can reduce accuracy. Must be positive. Unset uses the model default. Requires --enable-asr-encoder-window.",
     ] = None
     asr_decoder_prefix_max_tokens: A[
         Optional[int],
-        "Override the transcript-prefix token limit for encoder-window realtime ASR. Must be positive. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+        "Maximum tokens of recent confirmed transcript text included in each decoder prompt. Must be positive. Unset uses the model default. Requires --enable-asr-encoder-window.",
     ] = None
     asr_decoder_prefix_holdback_units: A[
         Optional[int],
-        "Override the number of agreed text units held back in encoder-window realtime ASR (words for English). Must be non-negative; 0 disables the extra holdback. Unset uses the model adapter's default. Only used with --enable-asr-encoder-window.",
+        "Number of matching words or CJK characters to keep unsent so later audio can extend them. Must be non-negative; 0 sends all matching text. Unset uses the model default. Requires --enable-asr-encoder-window.",
     ] = None
     enable_asr_decoder_streaming: A[
         bool,
-        "Publish append-safe realtime transcription deltas while a backend ASR decode is still running (each backend request streams). Independent of --enable-asr-encoder-window. Experimental.",
+        "Send new transcript text while the model is still generating a response. Already sent text cannot be revised. Can be used with or without --enable-asr-encoder-window. Experimental.",
     ] = False
     preferred_sampling_params: A[
         Optional[str],

@@ -79,11 +79,11 @@ from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
 
-# 60 s * 48,000 samples/s * 2 bytes/sample (PCM16) * 2 for base64/JSON
-# overhead = 11,520,000 bytes. Raising the item limit must not grow this backlog.
-MAX_PENDING_INPUT_BYTES = 11_520_000
+# Bound queued messages independently of the audio item limit: 60 s of PCM16 at
+# 48 kHz, with a factor of two for base64 and JSON overhead.
+MAX_PENDING_MESSAGE_BYTES = 11_520_000
 
-# Conservative per-frame bookkeeping budget, including empty frames.
+# Charge even empty frames for queue storage so they cannot bypass the byte limit.
 QUEUED_FRAME_OVERHEAD_BYTES = 256
 
 
@@ -136,9 +136,7 @@ class _SessionConfig:
 
 @dataclass
 class _ItemState:
-    """Per-item conversation ids. current_item_id is reserved at
-    __init__ and only announced to the client by
-    input_audio_buffer.committed."""
+    """Keep item IDs stable across partial transcripts and the final commit."""
 
     current_item_id: str
     previous_item_id: Optional[str] = None
@@ -173,13 +171,16 @@ class RealtimeConnection:
             tokenizer_manager=tokenizer_manager,
             adapter=adapter,
             encoder_window=encoder_window,
-            session_id=self.session_id,
         )
-        self.transcription_state = self.transcription_processor.create_state()
+        self.transcription_state = (
+            self.transcription_processor.create_transcription_state()
+        )
 
         self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
-        self.incoming_messages: asyncio.Queue[tuple[Message, int]] = asyncio.Queue()
-        self.pending_input_bytes = 0
+        self.pending_client_messages: asyncio.Queue[tuple[Message, int]] = (
+            asyncio.Queue()
+        )
+        self.pending_message_bytes = 0
 
     async def run(self) -> None:
         await self._send(
@@ -191,17 +192,17 @@ class RealtimeConnection:
         )
 
         try:
-            # Keep receiving while inference waits, so disconnects and backlog
-            # overflow can cancel the active backend request promptly.
-            receiver_task = asyncio.create_task(self.receive_messages())
+            # Keep receiving during transcription so disconnects or queue overflow
+            # can cancel the backend request promptly.
+            receiver_task = asyncio.create_task(self.receive_client_messages())
             consumer_task = asyncio.create_task(self._run_loop())
-            overflow = False
+            queue_overflow = False
             try:
                 done, _ = await asyncio.wait(
                     (receiver_task, consumer_task), return_when=asyncio.FIRST_COMPLETED
                 )
                 if receiver_task in done:
-                    overflow = receiver_task.result()
+                    queue_overflow = receiver_task.result()
                 else:
                     consumer_task.result()
             finally:
@@ -211,11 +212,11 @@ class RealtimeConnection:
                 await asyncio.gather(
                     receiver_task, consumer_task, return_exceptions=True
                 )
-                self.incoming_messages = asyncio.Queue()
-                self.pending_input_bytes = 0
+                self.pending_client_messages = asyncio.Queue()
+                self.pending_message_bytes = 0
 
-            if overflow:
-                # Overflow belongs to the connection, not the interrupted event.
+            if queue_overflow:
+                # No single client event caused the queue to exceed its limit.
                 self._current_client_event_id = None
                 await self._send_error_and_close(
                     "buffer_overflow",
@@ -239,24 +240,27 @@ class RealtimeConnection:
                     e,
                 )
 
-    async def receive_messages(self) -> bool:
-        """Queue raw WebSocket frames; return True if the backlog exceeds its cap."""
+    async def receive_client_messages(self) -> bool:
+        """Keep disconnects detectable during transcription; report queue overflow."""
         while True:
             message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":
                 raise WebSocketDisconnect(code=message.get("code", 1000))
             else:
-                size = (
+                message_size_bytes = (
                     len((message.get("text") or "").encode("utf-8"))
                     + len(message.get("bytes") or b"")
                     + QUEUED_FRAME_OVERHEAD_BYTES
                 )
-            if self.pending_input_bytes + size > MAX_PENDING_INPUT_BYTES:
-                # Waiting for queue space would hide disconnects behind audio.
+            if (
+                self.pending_message_bytes + message_size_bytes
+                > MAX_PENDING_MESSAGE_BYTES
+            ):
+                # Waiting for queue space would prevent reading disconnect messages.
                 return True
             else:
-                self.pending_input_bytes += size
-                self.incoming_messages.put_nowait((message, size))
+                self.pending_message_bytes += message_size_bytes
+                self.pending_client_messages.put_nowait((message, message_size_bytes))
                 await asyncio.sleep(0)
 
     async def _run_loop(self) -> None:
@@ -266,10 +270,10 @@ class RealtimeConnection:
         """
         while True:
             self._current_client_event_id = None
-            # A nonempty queue and short handlers may otherwise never yield.
+            # Let the receiver run even when queued messages finish without awaiting.
             await asyncio.sleep(0)
-            message, size = await self.incoming_messages.get()
-            self.pending_input_bytes -= size
+            message, message_size_bytes = await self.pending_client_messages.get()
+            self.pending_message_bytes -= message_size_bytes
 
             text = message.get("text")
             if not text:
@@ -377,7 +381,7 @@ class RealtimeConnection:
             )
             return
 
-        # Omitted transcription fields keep their values; explicit null clears.
+        # Keep omitted settings; explicit null lets clients clear a previous value.
         new_client_model = self.config.client_model
         new_language = self.config.language
         if transcription is not None:
@@ -389,7 +393,6 @@ class RealtimeConnection:
             new_client_model = None
             new_language = None
 
-        # Reject a non-empty model name that differs from the server's model name.
         if (
             new_client_model
             and new_client_model != self.tokenizer_manager.served_model_name
@@ -403,8 +406,7 @@ class RealtimeConnection:
             )
             return
 
-        # Reject language changes once this item contains audio or decoded text.
-        # The client must commit or clear the item first.
+        # One audio item must use the same language for every transcription request.
         if new_language != self.config.language and (
             self.transcription_state.has_audio
             or self.transcription_state.has_transcript
@@ -444,8 +446,7 @@ class RealtimeConnection:
             else:
                 new_rate = fmt.rate or DEFAULT_INPUT_SAMPLE_RATE
 
-            # Reject input rate changes after receiving audio for this item.
-            # The client must commit or clear the item first.
+            # Changing the rate would mix differently sampled audio in one item.
             if (
                 new_rate != self.config.input_sample_rate
                 and self.transcription_state.has_audio
@@ -458,8 +459,7 @@ class RealtimeConnection:
                 )
                 return
 
-        # Save the input rate, model name, and language; build decoder sampling
-        # parameters and mark the session ready to accept audio frames.
+        # Save settings only after the entire update has passed validation.
         self.config.input_sample_rate = new_rate
         self.config.client_model = new_client_model
         self.config.language = new_language
@@ -468,8 +468,6 @@ class RealtimeConnection:
         )
         self.config.configured = True
 
-        # Log ignored include[] options and required audio resampling, then send
-        # the current input format, model, and language in session.updated.
         if cfg.include:
             logger.info(
                 "[realtime] %s: include[] received but not implemented; ignoring: %s",
@@ -548,10 +546,11 @@ class RealtimeConnection:
                 self.config.input_sample_rate,
                 self.model_sample_rate,
             )
-        self.transcription_state.audio.append_pcm(data)
-        # The processor selects the request range; windowing may leave more
-        # inference chunks to drain from a single append.
-        while self.transcription_processor.is_chunk_ready(self.transcription_state):
+        self.transcription_state.audio.data.extend(data)
+        # One append can contain several audio chunks that need separate requests.
+        while self.transcription_processor.is_audio_chunk_ready(
+            self.transcription_state
+        ):
             ok = await self._run_inference(is_last=False)
             if not ok:
                 # Stream already finished inside _run_inference.
@@ -573,9 +572,8 @@ class RealtimeConnection:
             )
             return
 
-        # A skipped or truncated intermediate decode leaves its audio unprocessed,
-        # forcing one final decode so the item either recovers or fails closed.
-        has_new_audio = self.transcription_state.has_new_audio
+        # Retry unprocessed audio before reporting the transcript as complete.
+        has_unprocessed_audio = self.transcription_state.has_unprocessed_audio
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
 
@@ -614,7 +612,7 @@ class RealtimeConnection:
             self.transcription_state.audio.received_bytes / self.bytes_per_second
         )
 
-        if has_new_audio or self.transcription_state.has_transcript:
+        if has_unprocessed_audio or self.transcription_state.has_transcript:
             ok = await self._run_inference(is_last=True)
             if not ok:
                 # _run_inference already emitted transcription.failed and
@@ -653,16 +651,17 @@ class RealtimeConnection:
         )
 
     async def _run_inference(self, is_last: bool) -> bool:
-        """Run ASR on the current buffer. Returns False on failure:
-        commit-time emits transcription.failed and rolls the item; append-time
-        emits a generic error envelope and closes the WebSocket."""
+        """Process buffered audio, returning False on failure.
+
+        Final failures reset the audio item; append failures close the connection.
+        """
         try:
-            if is_last and not self.transcription_state.has_new_audio:
+            if is_last and not self.transcription_state.has_unprocessed_audio:
                 await self.transcription_processor.flush_pending_transcript(
                     self.transcription_state, self._emit_transcription_delta
                 )
             else:
-                await self.transcription_processor.process(
+                await self.transcription_processor.process_transcription(
                     self.transcription_state,
                     is_last=is_last,
                     sampling_params=self.config.sampling_params,
@@ -709,7 +708,7 @@ class RealtimeConnection:
         return True
 
     async def _emit_transcription_delta(self, delta: str) -> None:
-        """Wrap the processor's exact append string without reformatting."""
+        """Preserve the processor's spacing when sending new transcript text."""
         await self._send(
             ConversationItemInputAudioTranscriptionDeltaEvent(
                 event_id=f"event_{random_uuid()}",
@@ -726,8 +725,10 @@ class RealtimeConnection:
         self._reset_inference_state()
 
     def _reset_inference_state(self) -> None:
-        """Missing any of these resets leaks state across items."""
-        self.transcription_state = self.transcription_processor.create_state()
+        """Prevent audio and transcript state from leaking into the next item."""
+        self.transcription_state = (
+            self.transcription_processor.create_transcription_state()
+        )
 
     def _build_session_info(self) -> TranscriptionSessionConfig:
         # id / object aren't SDK fields; round-trip via extra='allow' so

@@ -220,9 +220,7 @@ class GenerateReqInput:
     use_audio_in_video: bool = False
     # Optional request-scoped video processor configuration.
     video_config: Optional[Dict[str, Any]] = None
-    # Optional request-scoped keyword arguments interpreted by the multimodal
-    # processor (for example windowing opt-in and leading audio context).
-    # Values must be JSON-compatible; a processor validates the keys it consumes.
+    # Carry per-request options such as audio windowing to the multimodal processor.
     mm_processor_kwargs: Optional[Dict[str, JsonValue]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None

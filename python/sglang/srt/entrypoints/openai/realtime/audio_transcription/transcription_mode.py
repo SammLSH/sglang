@@ -7,21 +7,21 @@ import msgspec
 from pydantic import JsonValue
 
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
-    ModeState,
     RealtimeTranscriptionState,
+    TranscriptionModeState,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-# Receives an exact append to TranscriptionStep.emitted_text, including boundary
-# spaces. Later candidates may include text already sent by earlier previews.
+# Each candidate includes all new text for this request, including text already
+# sent by earlier callbacks, so the caller must remove that part before sending.
 TranscriptCandidateCallback = Callable[[str], Awaitable[None]]
 
 
-class TranscriptionStep(msgspec.Struct, frozen=True):
-    """Fixed request baseline; the single consumer leaves mode_state unchanged."""
+class TranscriptionRequest(msgspec.Struct, frozen=True):
+    """Keep the starting audio range and text state fixed while transcription runs."""
 
     is_last: bool
     start_offset_bytes: int
@@ -29,63 +29,62 @@ class TranscriptionStep(msgspec.Struct, frozen=True):
     last_attempted_offset_bytes: int
     last_processed_offset_bytes: int
     emitted_text: str
-    mode_state: ModeState
-    # Extraction context before the first window, outside the window itself.
+    mode_state: TranscriptionModeState
+    # Keep preceding samples so feature extraction can compute the first frame.
     leading_context_bytes: int = 0
     decoder_prefix: str = ""
-    # Unpublished cumulative text seeds the first continuation candidate.
-    handoff_pending: str = ""
+    # Preserve unsent text when switching from cumulative to windowed transcription.
+    pending_transcript: str = ""
 
 
 class TranscriptionOutcome(msgspec.Struct, frozen=True):
-    """Candidate state and independent audio progress accepted after publication."""
+    """Apply these changes only after the transcript delta is sent successfully."""
 
-    next_mode_state: ModeState
-    audio_covered: bool
-    # Exact append to the step's published baseline (or the flush baseline).
-    # The publisher sends only the portion not already emitted by previews.
+    next_mode_state: TranscriptionModeState
+    # False keeps this audio in the next request so transcription can retry it.
+    audio_processed: bool
+    # Include all new text since the request started, even if some was streamed.
     delta: str = ""
-    discard_before_bytes: int | None = None
+    trim_buffer_offset_bytes: int | None = None
 
 
 class TranscriptionMode(ABC):
-    """Compute request outcomes without owning or mutating per-item progress."""
+    """Transcription results for the processor."""
 
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
         adapter: TranscriptionAdapter,
-        *,
-        routed_dp_rank: Optional[int] = None,
     ) -> None:
         self.tokenizer_manager = tokenizer_manager
         self.adapter = adapter
-        self.routed_dp_rank = routed_dp_rank
 
     @abstractmethod
-    def build_step(
+    def build_transcription_request(
         self,
         state: RealtimeTranscriptionState,
         *,
         end_offset_bytes: int,
         is_last: bool,
-    ) -> TranscriptionStep:
-        """Snapshot audio bounds and published text; reference accepted mode state."""
+    ) -> TranscriptionRequest:
+        """Prepare the audio range and text state for one audio transcription request."""
         ...
 
     @abstractmethod
-    async def execute_step(
+    async def transcribe_audio(
         self,
         state: RealtimeTranscriptionState,
-        step: TranscriptionStep,
+        request: TranscriptionRequest,
         *,
         sampling_params: Dict[str, JsonValue],
-        on_candidate: Optional[TranscriptCandidateCallback],
+        on_transcript_candidate: Optional[TranscriptCandidateCallback],
     ) -> TranscriptionOutcome:
-        """Compute candidates and return proposed changes for the caller to commit."""
+        """Run one audio transcription request and return its text and next state."""
         ...
 
     @abstractmethod
-    def flush_pending(self, state: RealtimeTranscriptionState) -> TranscriptionOutcome:
-        """Prepare held text for publication without another backend request."""
+    def flush_pending_transcript(
+        self, state: RealtimeTranscriptionState
+    ) -> TranscriptionOutcome:
+        """Prepare unsent transcript text without running the model again."""
         ...

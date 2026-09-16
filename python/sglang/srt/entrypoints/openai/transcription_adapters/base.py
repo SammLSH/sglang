@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -14,29 +13,16 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 
 class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
-    """Model-declared activation, context and text limits for windowed ASR."""
+    """Model defaults for when to use audio windows and how much context to retain."""
 
-    # Audio duration after which an item switches from cumulative decoding.
+    # Shorter recordings keep using cumulative transcription.
     min_audio_sec: float
-    # Complete windows kept in each steady-state request; older audio is
-    # represented only by the decoder prefix.
+    # Retain recent audio so each request can recognize speech across chunk edges.
     max_audio_context_windows: int
-    # Recent emitted text carried into each request as decoder context.
+    # Keep recent confirmed text in the prompt so the decoder can continue it.
     decoder_prefix_max_tokens: int = 192
-    # Agreed units held back from publication to absorb an unstable tail.
+    # Delay confirmed words or CJK characters because later audio may extend them.
     decoder_prefix_holdback_units: int = 1
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.min_audio_sec) or self.min_audio_sec < 0:
-            raise ValueError("min_audio_sec must be finite and non-negative")
-        elif self.max_audio_context_windows <= 0:
-            raise ValueError("max_audio_context_windows must be positive")
-        elif self.decoder_prefix_max_tokens <= 0:
-            raise ValueError("decoder_prefix_max_tokens must be positive")
-        elif self.decoder_prefix_holdback_units < 0:
-            raise ValueError("decoder_prefix_holdback_units must be non-negative")
-        else:
-            return
 
 
 class TranscriptionAdapter(ABC):
@@ -155,7 +141,8 @@ class TranscriptionAdapter(ABC):
     def postprocess_streaming_text(
         self, text: str, *, continuation: bool = False
     ) -> Optional[str]:
-        """Extract partial transcript text; return None while markers are incomplete.
+        """Return None for incomplete model markers so they stay out of the transcript.
+
         With continuation=True, the prompt already ends in transcript text.
         """
         return self.postprocess_text(text)

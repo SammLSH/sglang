@@ -73,8 +73,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = next(self.audio_tower.parameters()).device
 
-        # Items batched across requests can come from different audio
-        # durations, so their mel frame counts differ; pad before concatenating.
+        # Requests can have different audio lengths, so pad their features to batch them.
         input_features, feature_attention_mask = concat_padded_audio_features(items)
         input_features = input_features.type(self.audio_tower.dtype).to(device)
 
