@@ -129,7 +129,7 @@ def make_connection(
     get_context().override("realtime_asr_test", enable_asr_decoder_streaming=streaming)
     manager = ScriptedBackend(scripts, blocked=blocked)
     adapter = adapter or SimpleNamespace(
-        prompt_template="PROMPT:",
+        build_chunked_prompt=lambda prefix: "PROMPT:" + prefix,
         model_sample_rate=1,
         supports_chunked_streaming=True,
         postprocess_text=lambda text: text,

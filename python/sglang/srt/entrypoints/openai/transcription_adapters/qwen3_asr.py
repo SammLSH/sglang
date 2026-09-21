@@ -38,6 +38,12 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def prompt_template(self) -> str:
         return DEFAULT_ASR_PROMPT
 
+    def build_chunked_prompt(self, decoder_prefix: str) -> str:
+        if decoder_prefix:
+            return self.prompt_template + self.ASR_TEXT_TAG + decoder_prefix
+        else:
+            return self.prompt_template
+
     @property
     def realtime_encoder_window_policy(self) -> RealtimeEncoderWindowPolicy:
         return RealtimeEncoderWindowPolicy(

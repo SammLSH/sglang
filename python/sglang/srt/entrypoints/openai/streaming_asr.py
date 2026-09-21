@@ -298,7 +298,7 @@ async def generate_transcript(
     """
     stream = on_transcript_update is not None
     generation_request = GenerateReqInput(
-        text=adapter.prompt_template + decoder_prefix,
+        text=adapter.build_chunked_prompt(decoder_prefix),
         audio_data=audio_data,
         sampling_params=sampling_params,
         stream=stream,

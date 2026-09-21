@@ -122,6 +122,10 @@ class TranscriptionAdapter(ABC):
         """
         return ""
 
+    def build_chunked_prompt(self, decoder_prefix: str) -> str:
+        """Place confirmed transcript text in the model's continuation format."""
+        return self.prompt_template + decoder_prefix
+
     @property
     def chunked_streaming_config(self) -> dict:
         """Parameters for ``StreamingASRState`` when using chunked streaming.

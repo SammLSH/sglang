@@ -120,7 +120,7 @@ class TestTranscriptionBackendContract(CustomTestCase):
                     closed.append(True)
 
             adapter = SimpleNamespace(
-                prompt_template="PROMPT:",
+                build_chunked_prompt=lambda prefix: "PROMPT:" + prefix,
                 postprocess_text=lambda text: text,
                 postprocess_streaming_text=lambda text, **kwargs: text,
             )
