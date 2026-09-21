@@ -141,6 +141,9 @@ class TranscriptionSuffixState(msgspec.Struct):
             emitted_unit_count = max(
                 emitted_unit_count, len(candidate_text_units) - unfixed_units
             )
+        emitted_unit_count = min(
+            emitted_unit_count, max(0, len(candidate_text_units) - holdback_units)
+        )
         # Keep the separator with unsent text so the next delta preserves spacing.
         pending_text_start = (
             text_unit_spans[emitted_unit_count - 1][1] if emitted_unit_count else 0

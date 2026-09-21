@@ -21,6 +21,9 @@ maybe_stub_sgl_kernel()
 
 import numpy as np
 
+from sglang.srt.entrypoints.openai.realtime.audio_transcription.cumulative_transcription import (
+    CumulativeTranscriptionMode,
+)
 from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_state import (
     WindowedTranscriptionState,
 )
@@ -47,7 +50,7 @@ from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-BackendResponses = list[str | tuple[str, dict[str, JsonValue]]]
+BackendResponses = list[str | tuple[str, Optional[dict[str, JsonValue]]]]
 Result = TypeVar("Result")
 
 
@@ -224,6 +227,31 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(len(events_of_type(connection, ".failed")), 1)
         self.assertFalse(events_of_type(connection, ".completed"))
         self.assertFalse(connection.transcription_state.has_audio)
+
+        # An unpublished cumulative EOF keeps audio for final recovery.
+        manager, connection = make_connection([[], ["one two three"]])
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(append_audio(connection, bytes(4)))
+        state = connection.transcription_state
+        self.assertEqual(state.audio.last_processed_offset_bytes, 0)
+        self.assertEqual(state.mode_state.chunk_index, 0)
+        run_async(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        self.assertEqual(len(manager.requests), 2)
+        self.assertEqual(
+            published_transcript(connection), ("one two three", ["one two three"])
+        )
+
+        # EOF after publication cannot be retried as an unpublished request.
+        _, connection = make_connection(
+            [[("one two three four", None)]], streaming=True
+        )
+        with self.assertLogs(level="ERROR"):
+            self.assertTrue(append_audio(connection, bytes(4)))
+        self.assertTrue(connection.transcription_state.emitted_text)
+        self.assertEqual(
+            connection.transcription_state.audio.last_processed_offset_bytes, 0
+        )
+        self.assertFalse(events_of_type(connection, ".completed"))
 
     def test_window_requests_preserve_context_and_compact_pcm(
         self,
@@ -436,6 +464,13 @@ class TestRealtimeASR(CustomTestCase):
                 )
 
     def test_item_audio_limit_still_applies_after_window_retry(self) -> None:
+        manager, connection = make_connection([])
+        for chunk_seconds in (0, -1):
+            connection.adapter.chunked_streaming_config["chunk_size_sec"] = (
+                chunk_seconds
+            )
+            with self.assertRaisesRegex(ValueError, "positive PCM chunk"):
+                CumulativeTranscriptionMode(manager, connection.adapter)
         with get_context().override_server_args(asr_max_buffer_seconds=6):
             for window, scripts, sizes in (
                 (False, [["one two"]], [6]),

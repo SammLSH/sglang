@@ -65,6 +65,10 @@ class TranscriptionMode(ABC):
             * adapter.model_sample_rate
             * PCM_SAMPLE_WIDTH_BYTES
         )
+        if self.chunk_size_bytes <= 0:
+            raise ValueError(
+                "ASR chunk_size_sec must produce a positive PCM chunk size"
+            )
 
     @abstractmethod
     def create_state(self) -> TranscriptionModeState:

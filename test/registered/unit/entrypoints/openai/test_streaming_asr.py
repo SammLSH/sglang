@@ -14,10 +14,15 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.entrypoints.openai.streaming_asr import (
+    IncompleteTranscription,
     StreamingASRState,
     TranscriptionBackendAborted,
     apply_cumulative_transcript,
     generate_transcript,
+    process_asr_chunk,
+)
+from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (
+    Qwen3ASRAdapter,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -111,11 +116,11 @@ class TestTranscriptionBackendContract(CustomTestCase):
                 request: GenerateReqInput, raw_request: Optional[Request]
             ) -> AsyncIterator[dict[str, JsonValue]]:
                 try:
-                    if isinstance(frame, Exception):
-                        raise frame
-                    else:
-                        yield frame
-                    self.fail("non-stream read continued after its response")
+                    for frame in frames:
+                        if isinstance(frame, Exception):
+                            raise frame
+                        else:
+                            yield frame
                 finally:
                     closed.append(True)
 
@@ -125,11 +130,12 @@ class TestTranscriptionBackendContract(CustomTestCase):
                 postprocess_streaming_text=lambda text, **kwargs: text,
             )
             manager = SimpleNamespace(generate_request=_responses)
-            frame = {"text": "hello", "meta_info": {"finish_reason": {"type": "stop"}}}
+            frames = [
+                {"text": "hello", "meta_info": {"finish_reason": {"type": "stop"}}},
+                HTTPException(500, "must not read past stop"),
+            ]
             result = await generate_transcript(manager, adapter, bytes(4), {})
-            self.assertEqual(
-                (result.text, result.finish_reason, closed), ("hello", "stop", [True])
-            )
+            self.assertEqual((result, closed), ("hello", [True]))
             callback_error = HTTPException(503, "callback failed")
             abort = {
                 "meta_info": {
@@ -153,6 +159,7 @@ class TestTranscriptionBackendContract(CustomTestCase):
                     HTTPException,
                 ),
             ):
+                frames = [frame]
                 closed.clear()
                 with self.assertRaises(expected) as caught:
                     await generate_transcript(
@@ -163,6 +170,67 @@ class TestTranscriptionBackendContract(CustomTestCase):
                     self.assertTrue(caught.exception.retryable)
                 else:
                     self.assertIs(caught.exception, callback_error)
+
+            adapter = Qwen3ASRAdapter()
+            for raw, prefix, expected in (
+                ("\nlanguage English<asr_text>hello", "", "hello"),
+                ("language None<asr_text>", "", ""),
+                (" world", "hello", " world"),
+                (
+                    "language learning is important",
+                    " ",
+                    "language learning is important",
+                ),
+                (" \n", "hello", ""),
+            ):
+                frames = [{"text": raw, "meta_info": {"finish_reason": "stop"}}]
+                callback = AsyncMock()
+                result = await generate_transcript(
+                    manager,
+                    adapter,
+                    bytes(4),
+                    {},
+                    decoder_prefix=prefix,
+                    on_transcript_update=callback,
+                )
+                self.assertEqual(result, expected)
+                callback.assert_not_awaited()
+
+            for frames, expected in (
+                ([], "missing_terminal"),
+                ([{"text": "language English<asr_text>hello"}], "missing_terminal"),
+                (
+                    [
+                        {
+                            "text": "language English<as",
+                            "meta_info": {"finish_reason": "stop"},
+                        }
+                    ],
+                    "invalid_format",
+                ),
+                (
+                    [{"text": "plain body", "meta_info": {"finish_reason": "stop"}}],
+                    "invalid_format",
+                ),
+                (
+                    [{"text": "language", "meta_info": {"finish_reason": "length"}}],
+                    "length",
+                ),
+            ):
+                closed.clear()
+                with self.assertRaises(IncompleteTranscription) as caught:
+                    await generate_transcript(
+                        manager, adapter, bytes(4), {}, on_transcript_update=AsyncMock()
+                    )
+                self.assertEqual(caught.exception.reason, expected)
+                self.assertEqual(closed, [True])
+
+            state = StreamingASRState(2.0, 2, 5)
+            with self.assertRaises(IncompleteTranscription):
+                await process_asr_chunk(
+                    manager, adapter, state, bytes(4), {}, True, emitted_text=""
+                )
+            self.assertEqual((state.full_transcript, state.chunk_index), ("", 0))
 
         with patch(
             "sglang.srt.entrypoints.openai.streaming_asr.get_serving",

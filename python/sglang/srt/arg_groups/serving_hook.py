@@ -127,6 +127,25 @@ def handle_asr_validation(server_args: Any):
         and cfg.asr_decoder_prefix_holdback_units < 0
     ):
         raise ValueError("--asr-decoder-prefix-holdback-units must be non-negative.")
+    elif cfg.enable_asr_encoder_window:
+        if (
+            cfg.disaggregation_mode != "null"
+            or cfg.encoder_only
+            or cfg.language_only
+            or cfg.encoder_urls
+        ):
+            raise ValueError(
+                "--enable-asr-encoder-window does not support disaggregation."
+            )
+    elif any(
+        value is not None
+        for value in (
+            cfg.asr_encoder_window_max_context_windows,
+            cfg.asr_decoder_prefix_max_tokens,
+            cfg.asr_decoder_prefix_holdback_units,
+        )
+    ):
+        raise ValueError("ASR window overrides require --enable-asr-encoder-window.")
     else:
         return
 

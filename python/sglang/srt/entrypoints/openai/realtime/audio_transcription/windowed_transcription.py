@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_su
     TranscriptionSuffixState,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
+    IncompleteTranscription,
     TranscriptionBackendAborted,
     generate_transcript,
     iter_text_unit_spans,
@@ -214,7 +215,7 @@ class WindowedTranscriptionMode(TranscriptionMode):
             await on_transcript_candidate(transcript_candidate)
 
         try:
-            generated_transcript = await generate_transcript(
+            text = await generate_transcript(
                 tokenizer_manager=self.tokenizer_manager,
                 adapter=self.adapter,
                 audio_data=samples,
@@ -230,24 +231,9 @@ class WindowedTranscriptionMode(TranscriptionMode):
                 if on_transcript_candidate is not None
                 else None,
             )
-        except TranscriptionBackendAborted as error:
+        except (TranscriptionBackendAborted, IncompleteTranscription) as error:
             return self.handle_transcription_failure(state, request, error)
-        if generated_transcript is None:
-            return self.handle_transcription_failure(
-                state,
-                request,
-                RuntimeError("realtime ASR request returned no response"),
-            )
-        elif generated_transcript.finish_reason == "length":
-            return self.handle_transcription_failure(
-                state,
-                request,
-                RuntimeError("realtime ASR decode reached max_new_tokens"),
-            )
-        else:
-            return self.prepare_transcription_outcome(
-                request, generated_transcript.text
-            )
+        return self.prepare_transcription_outcome(request, text)
 
     def handle_transcription_failure(
         self,

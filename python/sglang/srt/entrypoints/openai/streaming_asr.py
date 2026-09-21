@@ -12,12 +12,12 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
     Union,
 )
 
-import msgspec
 import numpy as np
 import soundfile as sf
 from fastapi import HTTPException, Request
@@ -175,7 +175,7 @@ async def process_asr_chunk(
     """Transcribe one HTTP audio chunk and return text that has not been sent."""
     decoder_prefix = state.get_prefix_text(emitted_text=emitted_text)
     try:
-        result = await generate_transcript(
+        text = await generate_transcript(
             tokenizer_manager=tokenizer_manager,
             adapter=adapter,
             decoder_prefix=decoder_prefix,
@@ -191,11 +191,9 @@ async def process_asr_chunk(
             "[streaming_asr] chunk %d failed", state.chunk_index, exc_info=True
         )
         raise
-    if result is None:
-        return ""
     return apply_cumulative_transcript(
         state,
-        decoder_prefix + result.text,
+        decoder_prefix + text,
         is_last=is_last,
         emitted_text=emitted_text,
     )
@@ -274,11 +272,18 @@ class TranscriptionBackendAborted(RuntimeError):
         )
 
 
-class GeneratedTranscript(msgspec.Struct, frozen=True):
-    """Keep the stop reason so callers can retry or reject incomplete transcriptions."""
-
-    text: str
-    finish_reason: Optional[str]
+class IncompleteTranscription(RuntimeError):
+    def __init__(
+        self, reason: Literal["length", "missing_terminal", "invalid_format"]
+    ) -> None:
+        self.reason = reason
+        super().__init__(
+            {
+                "length": "ASR decode reached max_new_tokens",
+                "missing_terminal": "ASR backend ended without a successful stop",
+                "invalid_format": "ASR backend returned incomplete transcription metadata",
+            }[reason]
+        )
 
 
 async def generate_transcript(
@@ -291,8 +296,8 @@ async def generate_transcript(
     routing_key: Optional[str] = None,
     mm_processor_kwargs: Optional[Dict[str, JsonValue]] = None,
     on_transcript_update: Optional[Callable[[str], Awaitable[None]]] = None,
-) -> Optional[GeneratedTranscript]:
-    """Generate transcript text without the decoder prefix supplied in the prompt.
+) -> str:
+    """Return completed transcript text without the supplied decoder prefix.
 
     Each callback receives all text generated so far, allowing revised partial text.
     """
@@ -309,7 +314,6 @@ async def generate_transcript(
 
     cumulative_text = ""
     incremental = stream and get_serving().incremental_streaming_output
-    response = None
     async with aclosing(
         tokenizer_manager.generate_request(generation_request, raw_request)
     ) as responses:
@@ -317,7 +321,7 @@ async def generate_transcript(
             try:
                 response = await anext(responses)
             except StopAsyncIteration:
-                break
+                raise IncompleteTranscription("missing_terminal") from None
             except HTTPException as error:
                 # Match errors returned in streamed responses, while keeping
                 # callback failures separate from backend failures.
@@ -329,37 +333,35 @@ async def generate_transcript(
                 raise TranscriptionBackendAborted(
                     str(error.detail), status_code=error.status_code
                 ) from error
-            if get_finish_reason(response) == "abort":
-                finish_reason = response.get("meta_info", {}).get("finish_reason")
-                details = finish_reason if isinstance(finish_reason, dict) else {}
+            finish_reason = get_finish_reason(response)
+            if finish_reason == "abort":
+                details = response.get("meta_info", {}).get("finish_reason")
+                details = details if isinstance(details, dict) else {}
                 raise TranscriptionBackendAborted(
                     details.get("message") or "ASR backend request aborted",
                     status_code=details.get("status_code"),
                 )
-            if not stream:
-                break
-            chunk_text = response.get("text") or ""
+            elif finish_reason == "length":
+                raise IncompleteTranscription("length")
+            elif finish_reason not in (None, "stop"):
+                raise IncompleteTranscription("missing_terminal")
+            else:
+                chunk_text = response.get("text") or ""
             cumulative_text = (
                 cumulative_text + chunk_text if incremental else chunk_text
             )
-            if get_finish_reason(response) == "length":
-                # Do not send this incomplete result; the caller may need to retry it.
-                continue
             visible_text = adapter.postprocess_streaming_text(
                 cumulative_text, continuation=bool(decoder_prefix)
             )
-            if visible_text is not None:
+            if finish_reason == "stop":
+                if visible_text is None:
+                    raise IncompleteTranscription("invalid_format")
+                else:
+                    return normalize_whitespace(visible_text)
+            elif on_transcript_update is not None and visible_text is not None:
                 await on_transcript_update(normalize_whitespace(visible_text))
-
-    if response is None:
-        logger.warning("[streaming_asr] ASR request returned no response")
-        return None
-
-    raw_text = cumulative_text if stream else (response.get("text") or "")
-    return GeneratedTranscript(
-        text=normalize_whitespace(adapter.postprocess_text(raw_text)),
-        finish_reason=get_finish_reason(response),
-    )
+            else:
+                continue
 
 
 def get_finish_reason(response: Dict[str, JsonValue]) -> Optional[str]:

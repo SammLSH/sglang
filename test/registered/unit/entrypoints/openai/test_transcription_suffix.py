@@ -57,6 +57,17 @@ class TestTranscriptionSuffixState(CustomTestCase):
         self.assertEqual(update.delta + update.pending_text, candidate)
         self.assertEqual(state.pending_text, "Sibyl has ridden and driven.")
 
+        candidate = "one two three four five six seven eight nine ten"
+        for holdback, expected_units in ((0, 10), (1, 9), (6, 4), (10, 0)):
+            with self.subTest(holdback=holdback):
+                update = TranscriptionSuffixState(
+                    pending_text=candidate
+                ).prepare_transcript_update(
+                    candidate, is_last=False, holdback_units=holdback, unfixed_units=5
+                )
+                self.assertEqual(len(update.delta.split()), expected_units)
+                self.assertEqual(update.delta + update.pending_text, candidate)
+
     def test_confirmed_holdback_preserves_word_extensions_and_repeated_speech(
         self,
     ) -> None:

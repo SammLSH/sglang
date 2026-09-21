@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.realtime.audio_transcription.transcription_st
     RealtimeTranscriptionState,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
+    IncompleteTranscription,
     StreamingASRState,
     apply_cumulative_transcript,
     generate_transcript,
@@ -91,36 +92,37 @@ class CumulativeTranscriptionMode(TranscriptionMode):
                 )
                 await on_transcript_candidate(transcript_candidate)
 
-        generated_transcript = await generate_transcript(
-            tokenizer_manager=self.tokenizer_manager,
-            adapter=self.adapter,
-            decoder_prefix=decoder_prefix,
-            audio_data=samples,
-            sampling_params=sampling_params,
-            on_transcript_update=_send_partial_transcript
-            if on_transcript_candidate is not None
-            else None,
-        )
-        if generated_transcript is None:
-            if request.is_last:
-                raise RuntimeError("final realtime ASR request returned no response")
+        try:
+            text = await generate_transcript(
+                tokenizer_manager=self.tokenizer_manager,
+                adapter=self.adapter,
+                decoder_prefix=decoder_prefix,
+                audio_data=samples,
+                sampling_params=sampling_params,
+                on_transcript_update=_send_partial_transcript
+                if on_transcript_candidate is not None
+                else None,
+            )
+        except IncompleteTranscription as error:
+            if (
+                error.reason == "length"
+                or request.is_last
+                or state.emitted_text != request.emitted_text
+            ):
+                raise
             else:
-                logger.warning("[realtime] cumulative ASR request returned no response")
+                logger.warning("Cumulative ASR request incomplete: %s", error)
             # Keep the audio unprocessed so the next request retries it.
             return TranscriptionOutcome(
                 next_mode_state=previous_transcript_state, audio_processed=False
             )
-        elif generated_transcript.finish_reason == "length":
-            raise RuntimeError("realtime ASR decode reached max_new_tokens")
-        else:
-            recovering_unprocessed_audio = (
-                request.last_attempted_offset_bytes
-                > request.last_processed_offset_bytes
-            )
+        recovering_unprocessed_audio = (
+            request.last_attempted_offset_bytes > request.last_processed_offset_bytes
+        )
         if (
             recovering_unprocessed_audio
             and previous_transcript_state.full_transcript
-            and not generated_transcript.text
+            and not text
         ):
             if request.is_last:
                 raise RuntimeError("final realtime ASR recovery returned empty text")
@@ -132,7 +134,7 @@ class CumulativeTranscriptionMode(TranscriptionMode):
             transcript = copy(previous_transcript_state)
         delta = apply_cumulative_transcript(
             transcript,
-            decoder_prefix + generated_transcript.text,
+            decoder_prefix + text,
             is_last=request.is_last,
             emitted_text=request.emitted_text,
         )

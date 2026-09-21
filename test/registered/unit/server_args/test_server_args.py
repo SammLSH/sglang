@@ -154,7 +154,7 @@ class TestPrepareServerArgs(CustomTestCase):
             "asr_decoder_prefix_max_tokens": 128,
             "asr_decoder_prefix_holdback_units": 0,
         }
-        options = ["--model-path", "dummy"]
+        options = []
         for name, value in overrides.items():
             options.extend(("--" + name.replace("_", "-"), str(value)))
         for enabled, disabled in (
@@ -162,13 +162,46 @@ class TestPrepareServerArgs(CustomTestCase):
             ("enable_asr_decoder_streaming", "enable_asr_encoder_window"),
         ):
             with self.subTest(enabled=enabled):
-                args = prepare_server_args(options + ["--" + enabled.replace("_", "-")])
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--" + enabled.replace("_", "-")]
+                    + (options if enabled == "enable_asr_encoder_window" else [])
+                )
                 args.resolve_once()
                 serving_hook.handle_asr_validation(args)
                 self.assertTrue(resolution_result(args, enabled))
                 self.assertFalse(resolution_result(args, disabled))
-                for name, value in overrides.items():
-                    self.assertEqual(resolution_result(args, name), value)
+                if enabled == "enable_asr_encoder_window":
+                    for name, value in overrides.items():
+                        self.assertEqual(resolution_result(args, name), value)
+                else:
+                    self.assertIsNone(
+                        resolution_result(args, "asr_decoder_prefix_max_tokens")
+                    )
+
+        for name, value in overrides.items():
+            with (
+                self.subTest(override=name),
+                self.assertRaisesRegex(ValueError, "require --enable"),
+            ):
+                serving_hook.handle_asr_validation(
+                    ServerArgs(model_path="dummy", **{name: value})
+                )
+        for topology in (
+            {"disaggregation_mode": "prefill"},
+            {"disaggregation_mode": "decode"},
+            {"encoder_only": True},
+            {"language_only": True},
+            {"encoder_urls": ["http://localhost:30001"]},
+        ):
+            with (
+                self.subTest(topology=topology),
+                self.assertRaisesRegex(ValueError, "disaggregation"),
+            ):
+                serving_hook.handle_asr_validation(
+                    ServerArgs(
+                        model_path="dummy", enable_asr_encoder_window=True, **topology
+                    )
+                )
 
         # Dummy model resolution skips this hook, so exercise rejection directly.
         invalid = prepare_server_args(
